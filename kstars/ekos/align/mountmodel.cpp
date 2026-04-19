@@ -7,6 +7,7 @@
 #include "mountmodel.h"
 
 #include "align.h"
+#include "Options.h"
 #include "kstars.h"
 #include "kstarsdata.h"
 #include "flagcomponent.h"
@@ -1028,6 +1029,7 @@ void MountModel::startStopAlignmentProcedure()
             startAlignB->setIcon(
                 QIcon::fromTheme("media-playback-pause"));
             m_IsRunning = true;
+            saveAndOverrideSolverSettings();
             Q_EMIT newLog(i18n("The Mount Model Tool is Starting."));
             startAlignmentPoint();
         }
@@ -1040,6 +1042,7 @@ void MountModel::startStopAlignmentProcedure()
         Q_EMIT newLog(i18n("The Mount Model Tool is Paused."));
         Q_EMIT aborted();
         m_IsRunning = false;
+        restoreSolverSettings();
 
         QTableWidgetItem *statusReport = new QTableWidgetItem();
         statusReport->setFlags(Qt::ItemIsSelectable);
@@ -1094,12 +1097,36 @@ void MountModel::finishAlignmentPoint(bool solverSucceeded)
         else
         {
             m_IsRunning = false;
+            restoreSolverSettings();
             startAlignB->setIcon(
                 QIcon::fromTheme("media-playback-start"));
             Q_EMIT newLog(i18n("The Mount Model Tool is Finished."));
             currentAlignmentPoint = 0;
         }
     }
+}
+
+void MountModel::saveAndOverrideSolverSettings()
+{
+    m_savedUsePosition = Options::astrometryUsePosition();
+    m_savedUseScale    = Options::astrometryUseImageScale();
+    m_savedGotoMode    = static_cast<int>(m_AlignInstance->currentGOTOMode());
+
+    Options::setAstrometryUsePosition(false);
+    Options::setAstrometryUseImageScale(false);
+
+    // Only override the goto mode if it is not already GOTO_NOTHING (report-only run)
+    if (m_AlignInstance->currentGOTOMode() != Align::GOTO_NOTHING)
+        m_AlignInstance->setSolverAction(Align::GOTO_SYNC);
+
+    emit newLog(i18n("Mount model: forcing blind solve and sync for each alignment point."));
+}
+
+void MountModel::restoreSolverSettings()
+{
+    Options::setAstrometryUsePosition(m_savedUsePosition);
+    Options::setAstrometryUseImageScale(m_savedUseScale);
+    m_AlignInstance->setSolverAction(m_savedGotoMode);
 }
 
 void MountModel::setAlignStatus(Ekos::AlignState state)
