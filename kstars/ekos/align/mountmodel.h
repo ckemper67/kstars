@@ -37,7 +37,8 @@ class MountModel : public QDialog, public Ui::mountModel
             OBJECT_NAMED_STAR,
             OBJECT_ANY_OBJECT,
             OBJECT_FIXED_DEC,
-            OBJECT_FIXED_GRID
+            OBJECT_FIXED_GRID,
+            OBJECT_HALTON_SEQUENCE
         };
 
         void setTelescopeCoord(const SkyPoint &newCoord)
@@ -88,6 +89,7 @@ class MountModel : public QDialog, public Ui::mountModel
         int findNextAlignmentPointAfter(int currentSpot);
         int findClosestAlignmentPointToTelescope();
         void swapAlignPoints(int firstPt, int secondPt);
+        double halton(int index, int base);
 
         /**
              * @brief Get formatted RA & DEC coordinates compatible with astrometry.net format.

@@ -555,6 +555,62 @@ void MountModel::slotWizardAlignmentPoints()
         }
     }
 
+    if (alignTypeBox->currentIndex() == OBJECT_HALTON_SEQUENCE)
+    {
+        double lat = data->geo()->lat()->Degrees();
+        // Calculate the declination range that is visible above minAlt at some point
+        double minDec, maxDec;
+        if (lat >= 0)
+        {
+            minDec = qMax(-90.0, lat - (90.0 - minAlt));
+            maxDec = 90.0;
+        }
+        else
+        {
+            minDec = -90.0;
+            maxDec = qMin(90.0, lat + (90.0 - minAlt));
+        }
+
+        for (int i = 1; i <= points; i++)
+        {
+            double rawRA  = halton(i, 2);
+            double rawDec = halton(i, 3);
+
+            double ra      = rawRA * 24.0;
+            double sinMin  = std::sin(minDec * dms::DegToRad);
+            double sinMax  = std::sin(maxDec * dms::DegToRad);
+            double dec     = std::asin(sinMin + rawDec * (sinMax - sinMin)) * dms::RadToDeg;
+
+            QString ra_report, dec_report;
+            getFormattedCoords(ra, dec, ra_report, dec_report);
+
+            int currentRow = alignTable->rowCount();
+            alignTable->insertRow(currentRow);
+
+            QTableWidgetItem *RAReport = new QTableWidgetItem();
+            RAReport->setText(ra_report);
+            RAReport->setTextAlignment(Qt::AlignHCenter);
+            alignTable->setItem(currentRow, 0, RAReport);
+
+            QTableWidgetItem *DECReport = new QTableWidgetItem();
+            DECReport->setText(dec_report);
+            DECReport->setTextAlignment(Qt::AlignHCenter);
+            alignTable->setItem(currentRow, 1, DECReport);
+
+            QTableWidgetItem *ObjNameReport = new QTableWidgetItem();
+            ObjNameReport->setText(i18n("Halton Point %1", i));
+            ObjNameReport->setTextAlignment(Qt::AlignHCenter);
+            alignTable->setItem(currentRow, 2, ObjNameReport);
+
+            QTableWidgetItem *disabledBox = new QTableWidgetItem();
+            disabledBox->setFlags(Qt::ItemIsSelectable);
+            alignTable->setItem(currentRow, 3, disabledBox);
+        }
+        if (previewShowing)
+            updatePreviewAlignPoints();
+        return;
+    }
+
     //If there are less than 6 points, keep them all in the same DEC,
     //any more, set the num per row to be the sqrt of the points to evenly distribute in RA and DEC
     int numRAperDEC = 5;
@@ -737,6 +793,20 @@ void MountModel::calculateAZPointsForDEC(dms dec, dms alt, dms &AZEast, dms &AZW
     AZWest.setRadians(2.0 * dms::PI - AZRad);
 }
 
+double MountModel::halton(int index, int base)
+{
+    double result = 0;
+    double f      = 1.0 / base;
+    int i         = index;
+    while (i > 0)
+    {
+        result += f * (i % base);
+        i /= base;
+        f /= base;
+    }
+    return result;
+}
+
 const SkyObject *MountModel::getWizardAlignObject(double ra, double dec)
 {
     double maxSearch = 5.0;
@@ -746,6 +816,7 @@ const SkyObject *MountModel::getWizardAlignObject(double ra, double dec)
             return KStarsData::Instance()->skyComposite()->objectNearest(new SkyPoint(dms(ra), dms(dec)), maxSearch);
         case OBJECT_FIXED_DEC:
         case OBJECT_FIXED_GRID:
+        case OBJECT_HALTON_SEQUENCE:
             return nullptr;
 
         case OBJECT_ANY_STAR:
@@ -1053,11 +1124,14 @@ void MountModel::startAlignmentPoint()
     if (m_IsRunning && currentAlignmentPoint >= 0 && currentAlignmentPoint < alignTable->rowCount())
     {
         QTableWidgetItem *raCell = alignTable->item(currentAlignmentPoint, 0);
+        QTableWidgetItem *decCell = alignTable->item(currentAlignmentPoint, 1);
+        if (!raCell || !decCell)
+            return;
+
         QString raString         = raCell->text();
         dms raDMS                = dms::fromString(raString, false);
         double raDeg             = raDMS.Degrees();
 
-        QTableWidgetItem *decCell = alignTable->item(currentAlignmentPoint, 1);
         QString decString         = decCell->text();
         dms decDMS                = dms::fromString(decString, true);
         double dec                = decDMS.Degrees();
@@ -1067,7 +1141,10 @@ void MountModel::startAlignmentPoint()
         alignIndicator->startAnimation();
 
         const SkyObject *target = getWizardAlignObject(raDeg, dec);
-        m_AlignInstance->setTarget(*target);
+        if (target)
+            m_AlignInstance->setTarget(*target);
+        else
+            m_AlignInstance->setTarget(SkyPoint(dms(raDeg / 15.0), dms(dec)));
         m_AlignInstance->Slew();
     }
 }
