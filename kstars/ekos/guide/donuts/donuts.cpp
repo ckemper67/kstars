@@ -13,6 +13,8 @@
 #include <complex>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
+#include <limits>
 #include <utility>
 #include <cstddef>
 
@@ -23,10 +25,18 @@ namespace Donuts
 // Internal types
 // ---------------------------------------------------------------------------
 
-struct Profiles
+struct Quadrant
 {
-    std::vector<double> xProf;  // sum of bright pixels along each column -> x shift
-    std::vector<double> yProf;  // sum of bright pixels along each row    -> y shift
+    std::vector<double> xProf, yProf;
+    double xc { 0 };  // flux-weighted x-centroid relative to image centre
+    double yc { 0 };  // flux-weighted y-centroid relative to image centre
+};
+
+struct ProfileSet
+{
+    Quadrant q[4];
+    int width  { 0 };
+    int height { 0 };
 };
 
 struct FrameStats
@@ -170,15 +180,30 @@ static std::pair<double, double> correlate(
 // Profile building
 // ---------------------------------------------------------------------------
 
-static Profiles buildProfiles(
+static ProfileSet buildProfiles(
     const double *buf, int w, int h,
     const FrameStats &stats, const Config &cfg)
 {
-    const double threshold = stats.median + cfg.sigmaThreshold * stats.stddev;
+    ProfileSet p;
+    p.width  = w;
+    p.height = h;
 
-    Profiles p;
-    p.xProf.assign(w, 0.0);
-    p.yProf.assign(h, 0.0);
+    const double threshold = stats.median + cfg.sigmaThreshold * stats.stddev;
+    const int    qw        = static_cast<int>(w * (0.5 + cfg.quadrantOverlap / 2.0));
+    const int    qh        = static_cast<int>(h * (0.5 + cfg.quadrantOverlap / 2.0));
+
+    struct Range { int x0, y0, x1, y1; } qr[4] = {
+        {0,      0,      qw, qh},
+        {w - qw, 0,      w,  qh},
+        {0,      h - qh, qw, h },
+        {w - qw, h - qh, w,  h }
+    };
+
+    for (int i = 0; i < 4; ++i)
+    {
+        p.q[i].xProf.assign(qr[i].x1 - qr[i].x0, 0.0);
+        p.q[i].yProf.assign(qr[i].y1 - qr[i].y0, 0.0);
+    }
 
     for (int y = 0; y < h; ++y)
     {
@@ -188,14 +213,90 @@ static Profiles buildProfiles(
             if (val < threshold) continue;
             if (val > stats.clip) val = stats.clip;
             val -= stats.median;
-            p.xProf[x] += val;
-            p.yProf[y] += val;
+
+            for (int i = 0; i < 4; ++i)
+            {
+                if (x >= qr[i].x0 && x < qr[i].x1 && y >= qr[i].y0 && y < qr[i].y1)
+                {
+                    p.q[i].xProf[x - qr[i].x0] += val;
+                    p.q[i].yProf[y - qr[i].y0] += val;
+                }
+            }
         }
     }
 
-    filterSpikes(p.xProf, cfg.spikeRatio);
-    filterSpikes(p.yProf, cfg.spikeRatio);
+    const double mx = w / 2.0, my = h / 2.0;
+    for (int i = 0; i < 4; ++i)
+    {
+        filterSpikes(p.q[i].xProf, cfg.spikeRatio);
+        filterSpikes(p.q[i].yProf, cfg.spikeRatio);
+
+        double xFlux = 0.0, xMom = 0.0;
+        for (int k = 0; k < static_cast<int>(p.q[i].xProf.size()); ++k)
+        {
+            xFlux += p.q[i].xProf[k];
+            xMom  += (qr[i].x0 + k - mx) * p.q[i].xProf[k];
+        }
+        if (xFlux > 0.0) p.q[i].xc = xMom / xFlux;
+
+        double yFlux = 0.0, yMom = 0.0;
+        for (int k = 0; k < static_cast<int>(p.q[i].yProf.size()); ++k)
+        {
+            yFlux += p.q[i].yProf[k];
+            yMom  += (qr[i].y0 + k - my) * p.q[i].yProf[k];
+        }
+        if (yFlux > 0.0) p.q[i].yc = yMom / yFlux;
+    }
     return p;
+}
+
+// ---------------------------------------------------------------------------
+// Weighted least-squares 3-DoF solver
+// ---------------------------------------------------------------------------
+
+static Transform solveTransform(
+    const ProfileSet &refP, const ProfileSet &currP, const Config &cfg)
+{
+    Transform result;
+
+    double m11 = 0, m13 = 0, m22 = 0, m23 = 0;
+    double m33 = cfg.tikhonov;
+    double b1  = 0, b2  = 0, b3  = 0;
+    double minSNR = std::numeric_limits<double>::max();
+
+    for (int i = 0; i < 4; ++i)
+    {
+        auto rx = correlate(refP.q[i].xProf, currP.q[i].xProf,
+                            cfg.tukeyAlpha, cfg.lpCutoff);
+        auto ry = correlate(refP.q[i].yProf, currP.q[i].yProf,
+                            cfg.tukeyAlpha, cfg.lpCutoff);
+
+        minSNR = std::min({minSNR, rx.second, ry.second});
+
+        const double xi = refP.q[i].xc;
+        const double yi = refP.q[i].yc;
+        const double wx = rx.second * rx.second;
+        const double wy = ry.second * ry.second;
+
+        m11 += wx;
+        m13 += -yi * wx;
+        m22 += wy;
+        m23 += xi * wy;
+        m33 += (yi * yi * wx) + (xi * xi * wy);
+        b1  += rx.first * wx;
+        b2  += ry.first * wy;
+        b3  += (-yi * rx.first * wx) + (xi * ry.first * wy);
+    }
+
+    result.snr = minSNR;
+
+    const double det = m11 * (m22 * m33 - m23 * m23) - m13 * (m22 * m13);
+    if (std::abs(det) < 1e-9) return result;
+
+    result.dx     = (b1 * (m22 * m33 - m23 * m23) + m13 * (b2 * m23 - b3 * m22)) / det;
+    result.dy     = (b2 * (m11 * m33 - m13 * m13) + m23 * (b1 * m13 - b3 * m11)) / det;
+    result.dtheta = (m11 * (m22 * b3 - b2 * m23) + m13 * (0.0 - b1 * m22))       / det;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +306,7 @@ static Profiles buildProfiles(
 struct Guider::Impl
 {
     Config     cfg;
-    Profiles   refProfiles;
+    ProfileSet refProfiles;
     FrameStats refStats;
     bool       hasRef { false };
 };
@@ -229,22 +330,12 @@ Transform Guider::measure(const double *pixels, int width, int height)
 {
     if (!m_impl->hasRef) return {};
     auto curr = buildProfiles(pixels, width, height, m_impl->refStats, m_impl->cfg);
-
-    auto rx = correlate(m_impl->refProfiles.xProf, curr.xProf,
-                        m_impl->cfg.tukeyAlpha, m_impl->cfg.lpCutoff);
-    auto ry = correlate(m_impl->refProfiles.yProf, curr.yProf,
-                        m_impl->cfg.tukeyAlpha, m_impl->cfg.lpCutoff);
-
-    Transform t;
-    t.dx  = rx.first;
-    t.dy  = ry.first;
-    t.snr = std::min(rx.second, ry.second);
-    return t;
+    return solveTransform(m_impl->refProfiles, curr, m_impl->cfg);
 }
 
 void Guider::reset()
 {
-    m_impl->refProfiles = Profiles{};
+    m_impl->refProfiles = ProfileSet{};
     m_impl->hasRef = false;
 }
 

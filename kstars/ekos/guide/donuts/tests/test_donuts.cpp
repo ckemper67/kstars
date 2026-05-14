@@ -172,12 +172,28 @@ static void testSubPixelTranslation()
     CHECK_NEAR(t.dy, -0.4, 0.15);
 }
 
-static void testTranslationWithRotation()
+static void testPureRotation()
 {
-    // Verify that dx/dy accuracy is maintained even when the image also has
-    // a small rotation (as real sky frames do during Alt-Az tracking).
-    // The rotation component is ignored; only translation is reported.
-    std::printf("--- testTranslationWithRotation ---\n");
+    std::printf("--- testPureRotation ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 13);
+    auto ref   = makeFrame(W, H, stars);
+    auto curr  = transformFrame(ref, W, H, 0.0, 0.0, 0.5);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+    auto t = g.measure(curr.data(), W, H);
+
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  Expected 0.5 deg  Got %.4f deg  SNR=%.1f\n", deg, t.snr);
+
+    CHECK(t.valid());
+    CHECK_NEAR(deg, 0.5, 0.05);
+}
+
+static void testCombined()
+{
+    std::printf("--- testCombined ---\n");
     const int W = 512, H = 512;
     auto stars = randomStars(W, H, 80, 99);
     auto ref   = makeFrame(W, H, stars);
@@ -187,12 +203,14 @@ static void testTranslationWithRotation()
     g.setReference(ref.data(), W, H);
     auto t = g.measure(curr.data(), W, H);
 
-    std::printf("  Expected (2.0, 2.0)  Got (%.4f, %.4f)  SNR=%.1f\n",
-                t.dx, t.dy, t.snr);
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  Expected (2.0, 2.0, 0.2 deg)  Got (%.4f, %.4f, %.4f deg)  SNR=%.1f\n",
+                t.dx, t.dy, deg, t.snr);
 
     CHECK(t.valid());
     CHECK_NEAR(t.dx, 2.0, 0.15);
     CHECK_NEAR(t.dy, 2.0, 0.15);
+    CHECK_NEAR(deg,  0.2, 0.05);
 }
 
 static void testReset()
@@ -266,7 +284,8 @@ int main()
 {
     testPureTranslation();
     testSubPixelTranslation();
-    testTranslationWithRotation();
+    testPureRotation();
+    testCombined();
     testReset();
     testSmallImage();
     testConfig();
