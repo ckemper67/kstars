@@ -163,6 +163,7 @@ class Guide : public QWidget, public Ui::Guide
          * @return True if added successfully, false if duplicate or failed to add.
         */
         bool setAdaptiveOptics(ISD::AdaptiveOptics *device);
+        bool setRotator(ISD::Rotator *device);
 
         void removeDevice(const QSharedPointer<ISD::GenericDevice> &device);
         void configurePHD2Camera();
@@ -610,6 +611,7 @@ class Guide : public QWidget, public Ui::Guide
         ISD::Mount *m_Mount { nullptr };
         ISD::Guider *m_Guider { nullptr };
         ISD::AdaptiveOptics *m_AO { nullptr };
+        ISD::Rotator *m_Rotator { nullptr };
 
         // Guider process
         GuideInterface *m_GuiderInstance { nullptr };

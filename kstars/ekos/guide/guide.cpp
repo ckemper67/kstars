@@ -18,6 +18,7 @@
 #include "Options.h"
 #include "indi/indiguider.h"
 #include "indi/indiadaptiveoptics.h"
+#include "indi/indirotator.h"
 #include "auxiliary/QProgressIndicator.h"
 #include "ekos/auxiliary/opticaltrainmanager.h"
 #include "ekos/auxiliary/profilesettings.h"
@@ -761,6 +762,15 @@ bool Guide::setAdaptiveOptics(ISD::AdaptiveOptics * device)
 
     // FIXME AO are not yet utilized property in Guide module
     m_AO = device;
+    return true;
+}
+
+bool Guide::setRotator(ISD::Rotator *device)
+{
+    if (m_Rotator == device)
+        return false;
+
+    m_Rotator = device;
     return true;
 }
 
@@ -2120,6 +2130,21 @@ bool Guide::setGuiderType(int type)
             connect(internalGuider, &InternalGuider::newSinglePulse, this, &Guide::sendSinglePulse);
             connect(internalGuider, &InternalGuider::DESwapChanged, this, &Guide::setDECSwap);
             connect(internalGuider, &InternalGuider::newStarPixmap, this, &Guide::newStarPixmap);
+            connect(internalGuider, &InternalGuider::newRotationDelta, this, [this](double dTheta)
+            {
+                if (m_Rotator && m_Rotator->isConnected())
+                {
+                    // Don't stack corrections while the rotator is still moving from the prior frame.
+                    if (m_Rotator->absoluteAngleState() == IPS_BUSY)
+                        return;
+                    double correction = dTheta * Options::rotatorAggression();
+                    if (std::abs(correction) > Options::rotatorThreshold())
+                    {
+                        m_Rotator->guideDelta(correction);
+                        qCDebug(KSTARS_EKOS_GUIDE) << "DONUTS: Sending rotator delta:" << correction << "deg";
+                    }
+                }
+            });
 
             m_GuiderInstance = internalGuider;
 
@@ -3553,6 +3578,9 @@ void Guide::refreshOpticalTrain()
 
         auto ao = OpticalTrainManager::Instance()->getAdaptiveOptics(name);
         setAdaptiveOptics(ao);
+
+        auto rotator = OpticalTrainManager::Instance()->getRotator(name);
+        setRotator(rotator);
 
         // Load train settings
         OpticalTrainSettings::Instance()->setOpticalTrainID(id);

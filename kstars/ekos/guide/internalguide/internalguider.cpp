@@ -41,6 +41,7 @@ InternalGuider::InternalGuider()
     pmath.reset(new cgmath());
     connect(pmath.get(), &cgmath::newStarPosition, this, &InternalGuider::newStarPosition);
     connect(pmath.get(), &cgmath::guideStats, this, &InternalGuider::guideStats);
+    connect(pmath.get(), &cgmath::newRotationDelta, this, &InternalGuider::newRotationDelta);
 
     state = GUIDE_IDLE;
     m_DitherOrigin = QVector3D(0, 0, 0);

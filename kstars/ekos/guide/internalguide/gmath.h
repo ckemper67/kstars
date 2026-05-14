@@ -159,6 +159,8 @@ class cgmath : public QObject
     Q_SIGNALS:
         void newAxisDelta(double delta_ra, double delta_dec);
         void newStarPosition(QVector3D, bool);
+        void newRotationDelta(double dTheta);
+
         // For Analyze.
         void guideStats(double raError, double decError, int raPulse, int decPulse,
                         double snr, double skyBg, int numStars);

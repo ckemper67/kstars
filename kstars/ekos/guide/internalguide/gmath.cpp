@@ -51,6 +51,9 @@ GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imag
         // Synthesize virtual star position: Target + Measured Drift
         position.x = targetPosition.x + transform.dx;
         position.y = targetPosition.y + transform.dy;
+
+        // Emit rotation delta in degrees
+        Q_EMIT newRotationDelta(transform.dtheta * 180.0 / M_PI);
     }
     else if (usingSEPMultiStar())
     {
