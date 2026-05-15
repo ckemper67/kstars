@@ -444,6 +444,440 @@ static void testConfig()
 }
 
 // ---------------------------------------------------------------------------
+// McCormac et al. 2013 (PASP 125, 548) simulation scenario helpers
+// ---------------------------------------------------------------------------
+
+// Minimal Box-Muller RNG (no stdlib dependency)
+struct Rng
+{
+    uint32_t s;
+    explicit Rng(uint32_t seed = 1) : s(seed ? seed : 1) {}
+    double uni() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (s & 0xFFFFu) / 65536.0; }
+    double gauss() {
+        double u1 = uni() + 1e-10, u2 = uni();
+        return std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2);
+    }
+    double uniform(double lo, double hi) { return lo + uni() * (hi - lo); }
+};
+
+// Add additive Gaussian noise (sigma per pixel) to a frame.
+static std::vector<double> addGaussianNoise(
+    const std::vector<double> &src, double sigma, Rng &rng)
+{
+    std::vector<double> dst = src;
+    for (auto &v : dst) v += rng.gauss() * sigma;
+    return dst;
+}
+
+// Apply per-pixel multiplicative Gaussian noise: value *= (1 + N(0, sigma)).
+// McCormac 2013 Fig. 1 "green" scenario: sigma = 0.20 (+-20% per pixel).
+static std::vector<double> addMultiplicativeNoise(
+    const std::vector<double> &src, double sigma, Rng &rng)
+{
+    std::vector<double> dst = src;
+    for (auto &v : dst) v *= (1.0 + rng.gauss() * sigma);
+    return dst;
+}
+
+// Separable Gaussian blur.  sigma = 0 returns src unchanged.
+static std::vector<double> gaussianBlur(
+    const std::vector<double> &src, int w, int h, double sigma)
+{
+    if (sigma < 0.01) return src;
+    int r  = static_cast<int>(std::ceil(3.0 * sigma));
+    int ks = 2 * r + 1;
+    std::vector<double> k(ks);
+    double ksum = 0.0;
+    for (int i = 0; i < ks; ++i) {
+        double x = i - r;
+        k[i] = std::exp(-0.5 * x * x / (sigma * sigma));
+        ksum += k[i];
+    }
+    for (auto &kv : k) kv /= ksum;
+
+    // Horizontal pass
+    std::vector<double> tmp(w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            double s = 0.0;
+            for (int d = -r; d <= r; ++d)
+                s += src[y * w + std::max(0, std::min(w - 1, x + d))] * k[d + r];
+            tmp[y * w + x] = s;
+        }
+
+    // Vertical pass
+    std::vector<double> dst(w * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            double s = 0.0;
+            for (int d = -r; d <= r; ++d)
+                s += tmp[std::max(0, std::min(h - 1, y + d)) * w + x] * k[d + r];
+            dst[y * w + x] = s;
+        }
+    return dst;
+}
+
+// ---------------------------------------------------------------------------
+// McCormac 2013 ss3.5: S/N sweep (translation)
+// ---------------------------------------------------------------------------
+// The paper created 50x50 single-star stamps; we use a 256x256 multi-star
+// field because our 4-quadrant solver needs spatial coverage.  Noise is
+// Gaussian white added to the comparison frame only (reference is clean).
+// Success: |dx_residual| <= 0.3 px AND |dy_residual| <= 0.3 px.
+static void testSnrSweepTranslation()
+{
+    std::printf("--- testSnrSweepTranslation (McCormac 2013 s3.5 analog) ---\n");
+
+    const int    W       = 256, H = 256;
+    const double BG      = 1000.0;
+    const double PSF_SIG = 2.5 / 2.355;   // FWHM=2.5 px, as in paper
+    const double MAX_PK  = 50000.0;        // brightest star peak above BG
+    const int    N_SH    = 100;            // shifts per S/N level
+    const double RANGE   = 3.0;            // +/- px shift range
+
+    auto stars = randomStars(W, H, 20, 1234);
+    {   // normalise so brightest star has peak = MAX_PK
+        double mx = 0.0;
+        for (auto &st : stars) mx = std::max(mx, st.peak);
+        for (auto &st : stars) st.peak = st.peak / mx * MAX_PK;
+    }
+    auto ref = makeFrame(W, H, stars, BG, PSF_SIG);
+
+    const double snrTab[] = {1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 20.0};
+    const int    NL       = static_cast<int>(sizeof(snrTab) / sizeof(snrTab[0]));
+    double       pct[NL]  = {};
+
+    std::printf("  %5s  %8s  %7s  %7s\n", "S/N", "success%", "mE_dx", "mE_dy");
+
+    for (int li = 0; li < NL; ++li)
+    {
+        double sigma_n = MAX_PK / snrTab[li];
+        Rng    rng(1000 + li * 37);
+        Donuts::Guider g;
+        g.setReference(ref.data(), W, H);
+        int    npass = 0;
+        double sEx = 0.0, sEy = 0.0;
+
+        for (int sh = 0; sh < N_SH; ++sh)
+        {
+            double tdx = rng.uniform(-RANGE, RANGE);
+            double tdy = rng.uniform(-RANGE, RANGE);
+            auto cur = addGaussianNoise(
+                transformFrame(ref, W, H, tdx, tdy, 0.0), sigma_n, rng);
+            auto t  = g.measure(cur.data(), W, H);
+            double ex = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+            if (t.valid() && ex <= 0.3 && ey <= 0.3) { ++npass; sEx += ex; sEy += ey; }
+        }
+
+        pct[li]       = 100.0 * npass / N_SH;
+        double mex    = (npass > 0) ? sEx / npass : 99.9;
+        double mey    = (npass > 0) ? sEy / npass : 99.9;
+        std::printf("  %5.1f  %8.1f  %7.4f  %7.4f\n", snrTab[li], pct[li], mex, mey);
+    }
+
+    // Our phase-only correlation + 3-sigma detection threshold gives a higher
+    // limiting S/N than the original paper (which used amplitude correlation on
+    // a single star).  At S/N=20 the algorithm must be reliable; below S/N=5
+    // it is expected to fail.
+    CHECK(pct[8] >= 95.0);   // S/N=20 (index 8) -> >= 95% success
+    CHECK(pct[0] < 80.0);    // S/N=1  (index 0) -> not perfect (sanity)
+}
+
+// ---------------------------------------------------------------------------
+// McCormac 2013 Fig 1 (blue): uniform intensity change robustness
+// ---------------------------------------------------------------------------
+// The overall comparison-frame flux is scaled uniformly.  Phase-only
+// cross-correlation normalises spectral amplitude, so this should have
+// negligible effect on the result.
+static void testUniformIntensityChange()
+{
+    std::printf("--- testUniformIntensityChange (McCormac 2013 Fig 1 blue) ---\n");
+
+    const int    W = 256, H = 256;
+    const double PSF_SIG = 2.5 / 2.355;
+    auto stars = randomStars(W, H, 20, 77);
+    auto ref   = makeFrame(W, H, stars, 1000.0, PSF_SIG);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+
+    const double tdx = 3.5, tdy = -2.0;
+    auto shifted = transformFrame(ref, W, H, tdx, tdy, 0.0);
+
+    const double scales[] = {0.5, 0.75, 1.25, 1.5, 2.0};
+    std::printf("  %6s  %8s  %8s\n", "scale", "dx_err", "dy_err");
+    for (double sc : scales)
+    {
+        std::vector<double> cur(shifted.size());
+        for (std::size_t i = 0; i < shifted.size(); ++i) cur[i] = shifted[i] * sc;
+        auto t  = g.measure(cur.data(), W, H);
+        double ex = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+        std::printf("  %6.2f  %8.4f  %8.4f\n", sc, ex, ey);
+        CHECK(t.valid());
+        CHECK(ex <= 0.15);
+        CHECK(ey <= 0.15);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// McCormac 2013 Fig 1 (green): per-pixel multiplicative noise robustness
+// ---------------------------------------------------------------------------
+// Each comparison pixel is randomly scaled by N(1, 0.20), matching the
+// paper's "standard deviation of 1 from +-20% of the intensity modified
+// pixel value".
+static void testPixelNoise()
+{
+    std::printf("--- testPixelNoise (McCormac 2013 Fig 1 green) ---\n");
+
+    const int    W = 256, H = 256;
+    const double PSF_SIG = 2.5 / 2.355;
+    auto stars = randomStars(W, H, 20, 77);
+    auto ref   = makeFrame(W, H, stars, 1000.0, PSF_SIG);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+
+    const double tdx = 3.5, tdy = -2.0;
+    auto shifted = transformFrame(ref, W, H, tdx, tdy, 0.0);
+
+    // 20 trials with different noise seeds; all must pass.
+    int npass = 0;
+    for (int trial = 0; trial < 20; ++trial)
+    {
+        Rng rng(500 + trial * 7);
+        auto cur = addMultiplicativeNoise(shifted, 0.20, rng);
+        auto t   = g.measure(cur.data(), W, H);
+        double ex = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+        if (t.valid() && ex <= 0.3 && ey <= 0.3) ++npass;
+    }
+    std::printf("  %d / 20 trials passed (+-20%% per-pixel noise)\n", npass);
+    CHECK(npass >= 18);
+}
+
+// ---------------------------------------------------------------------------
+// McCormac 2013 ss3.6: seeing change robustness
+// ---------------------------------------------------------------------------
+// Reference is in focus (FWHM = 2.5 px).  Comparison frames are Gaussian-
+// blurred to simulate seeing deterioration (0-125% FWHM increase), then
+// shifted by a fixed amount.  Blur sigma derived from quadrature addition:
+//   sigma_blur = sigma_ref * sqrt((1+delta)^2 - 1)
+static void testSeeingChange()
+{
+    std::printf("--- testSeeingChange (McCormac 2013 s3.6 / Table 4 analog) ---\n");
+
+    const int    W       = 256, H = 256;
+    const double PSF_SIG = 2.5 / 2.355;   // sigma for FWHM=2.5 px
+    // Uniform peak brightness so all stars survive heavy blurring: a star
+    // blurred to 125% FWHM has its peak reduced by (sigma_ref/sigma_result)^2
+    // = 1/(1+1.25)^2 = 0.18.  At peak=30000 the blurred peak is 5400, well
+    // above the threshold set from the clean reference frame.
+    auto stars = randomStars(W, H, 30, 77);
+    for (auto &st : stars) st.peak = 30000.0;
+    auto ref   = makeFrame(W, H, stars, 1000.0, PSF_SIG);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+
+    const double tdx = 2.0, tdy = -1.5;
+    auto shifted = transformFrame(ref, W, H, tdx, tdy, 0.0);
+
+    // delta_FWHM levels (fraction) matching Table 4 of paper
+    const double deltas[]   = {0.00, 0.20, 0.35, 0.50, 0.65, 0.80, 0.95, 1.10, 1.25};
+    const int    ND         = static_cast<int>(sizeof(deltas) / sizeof(deltas[0]));
+
+    std::printf("  %8s  %8s  %8s  %8s\n",
+                "dFWHM%", "FWHM_px", "dx_err", "dy_err");
+
+    for (int i = 0; i < ND; ++i)
+    {
+        double d         = deltas[i];
+        double fwhm_res  = 2.5 * (1.0 + d);
+        double sig_res   = fwhm_res / 2.355;
+        double sig_blur  = PSF_SIG * std::sqrt((1.0 + d) * (1.0 + d) - 1.0);
+        auto   blurred   = gaussianBlur(shifted, W, H, sig_blur);
+        auto   t         = g.measure(blurred.data(), W, H);
+        double ex        = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+        std::printf("  %8.0f  %8.2f  %8.4f  %8.4f\n",
+                    d * 100.0, fwhm_res, ex, ey);
+        // Phase-only cross-correlation normalises amplitude, so PSF broadening
+        // mainly reduces the high-frequency content of the profiles.  Residual
+        // errors stay sub-pixel but exceed the 0.3 px of the paper's amplitude-
+        // correlation algorithm at large blur levels.
+        CHECK(t.valid());
+        CHECK(ex <= 0.5);
+        CHECK(ey <= 0.5);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// McCormac 2013 extension: S/N sweep with rotation
+// ---------------------------------------------------------------------------
+// Same noise model as testSnrSweepTranslation but the comparison frame also
+// carries a small rotation (0.3 deg).  At high S/N all three DoFs should
+// be recovered; rotation accuracy degrades as noise rises.
+static void testSnrSweepWithRotation()
+{
+    std::printf("--- testSnrSweepWithRotation (McCormac 2013 extension) ---\n");
+
+    const int    W        = 256, H = 256;
+    const double BG       = 1000.0;
+    const double PSF_SIG  = 2.5 / 2.355;
+    const double STAR_PK  = 30000.0;       // uniform brightness: S/N = STAR_PK / sigma_noise
+    const int    N_SH     = 100;
+    const double RANGE    = 1.5;           // +/- px
+    const double ROT_DEG  = 0.5;          // fixed rotation; at W/4=64px lever arm -> 0.56 px arc
+
+    // Uniform-brightness stars so the S/N definition is unambiguous and
+    // all stars remain detectable across all tested noise levels.
+    auto stars = randomStars(W, H, 40, 5678);
+    for (auto &st : stars) st.peak = STAR_PK;
+    auto ref = makeFrame(W, H, stars, BG, PSF_SIG);
+
+    const double snrTab[] = {3.0, 5.0, 7.0, 10.0, 15.0, 20.0};
+    const int    NL       = static_cast<int>(sizeof(snrTab) / sizeof(snrTab[0]));
+    double       pctXY[NL] = {}, pctRot[NL] = {};
+
+    std::printf("  %5s  %8s  %8s\n", "S/N", "XY_ok%%", "rot_ok%%");
+
+    for (int li = 0; li < NL; ++li)
+    {
+        double sigma_n = STAR_PK / snrTab[li];
+        Rng    rng(2000 + li * 53);
+        Donuts::Guider g;
+        g.setReference(ref.data(), W, H);
+        int nXY = 0, nRot = 0;
+
+        for (int sh = 0; sh < N_SH; ++sh)
+        {
+            double tdx = rng.uniform(-RANGE, RANGE);
+            double tdy = rng.uniform(-RANGE, RANGE);
+            auto cur   = addGaussianNoise(
+                transformFrame(ref, W, H, tdx, tdy, ROT_DEG), sigma_n, rng);
+            auto t     = g.measure(cur.data(), W, H);
+            double ex  = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+            double er  = std::abs(t.dtheta * 180.0 / M_PI - ROT_DEG);
+            bool xyOk  = t.valid() && ex <= 0.3 && ey <= 0.3;
+            bool rotOk = t.valid() && er <= 0.1;
+            if (xyOk)  ++nXY;
+            if (rotOk) ++nRot;
+        }
+
+        pctXY[li]  = 100.0 * nXY  / N_SH;
+        pctRot[li] = 100.0 * nRot / N_SH;
+        std::printf("  %5.1f  %8.1f  %8.1f\n",
+                    snrTab[li], pctXY[li], pctRot[li]);
+    }
+
+    // Translation at S/N=20 must be reliable (index 5).
+    CHECK(pctXY[5] >= 90.0);
+    // Rotation detection is harder: the differential centroid shift per quadrant
+    // (~35px lever arm * 0.5 deg = 0.31 px) competes with translation noise.
+    // 70% success at S/N=20 correctly characterises the algorithm's rotation
+    // sensitivity floor under combined noise + translation.
+    CHECK(pctRot[5] >= 70.0);
+}
+
+// ---------------------------------------------------------------------------
+// Translation-only characterisation tests
+// (mirrored into Tests/ekos/guide/testdonutsguider.cpp later)
+// ---------------------------------------------------------------------------
+
+// Sweep translation magnitude from 0.5 to 8.0 px along a diagonal.
+// Characterises how accuracy degrades as the shift grows relative to the
+// profile length; asserts <= 0.3 px for shifts that fit within the linear
+// regime of the phase correlation.
+static void testTranslationMagnitudeSweep()
+{
+    std::printf("--- testTranslationMagnitudeSweep ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 42);
+    auto ref   = makeFrame(W, H, stars);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+
+    std::printf("  %6s  %8s  %8s\n", "shift", "dx_err", "dy_err");
+    for (int i = 1; i <= 16; ++i)
+    {
+        double shift = i * 0.5;
+        double tdx   = shift, tdy = shift * 0.7;   // non-square to expose asymmetry
+        auto   cur   = transformFrame(ref, W, H, tdx, tdy, 0.0);
+        auto   t     = g.measure(cur.data(), W, H);
+        double ex    = std::abs(t.dx - tdx), ey = std::abs(t.dy - tdy);
+        std::printf("  %6.1f  %8.4f  %8.4f  %s\n",
+                    shift, ex, ey, (ex <= 0.3 && ey <= 0.3) ? "ok" : "DEGRADED");
+        if (shift <= 6.0)
+        {
+            CHECK(t.valid());
+            CHECK(ex <= 0.3);
+            CHECK(ey <= 0.3);
+        }
+    }
+}
+
+// Verify translation accuracy is symmetric across all 8 compass directions.
+static void testTranslationDirections()
+{
+    std::printf("--- testTranslationDirections ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 31);
+    auto ref   = makeFrame(W, H, stars);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+
+    struct Case { double dx, dy; const char *label; };
+    const Case cases[] = {
+        {  5.0,  0.0, "E "  }, { -5.0,  0.0, "W "  },
+        {  0.0,  5.0, "S "  }, {  0.0, -5.0, "N "  },
+        {  3.5,  3.5, "SE"  }, { -3.5,  3.5, "SW"  },
+        {  3.5, -3.5, "NE"  }, { -3.5, -3.5, "NW"  },
+    };
+    std::printf("  %4s  %8s  %8s\n", "dir", "dx_err", "dy_err");
+    for (const auto &c : cases)
+    {
+        auto cur = transformFrame(ref, W, H, c.dx, c.dy, 0.0);
+        auto t   = g.measure(cur.data(), W, H);
+        double ex = std::abs(t.dx - c.dx), ey = std::abs(t.dy - c.dy);
+        std::printf("  %4s  %8.4f  %8.4f\n", c.label, ex, ey);
+        CHECK(t.valid());
+        CHECK(ex <= 0.15);
+        CHECK(ey <= 0.15);
+    }
+}
+
+// Verify the algorithm works across a range of guide star counts.
+// In the field this matters: sparse fields (few stars) give weaker profiles.
+static void testStarDensity()
+{
+    std::printf("--- testStarDensity ---\n");
+    const int    W  = 512, H = 512;
+    const double DX = 4.3, DY = -3.1;
+    const int    counts[] = {5, 10, 20, 40, 80};
+
+    std::printf("  %6s  %8s  %8s  %6s\n", "stars", "dx_err", "dy_err", "SNR");
+    for (int n : counts)
+    {
+        auto stars = randomStars(W, H, n, 200 + n);
+        auto ref   = makeFrame(W, H, stars);
+        auto cur   = transformFrame(ref, W, H, DX, DY, 0.0);
+
+        Donuts::Guider g;
+        g.setReference(ref.data(), W, H);
+        auto t = g.measure(cur.data(), W, H);
+
+        double ex = std::abs(t.dx - DX), ey = std::abs(t.dy - DY);
+        std::printf("  %6d  %8.4f  %8.4f  %6.1f\n", n, ex, ey, t.snr);
+        if (n >= 10)
+        {
+            CHECK(t.valid());
+            CHECK(ex <= 0.3);
+            CHECK(ey <= 0.3);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -460,6 +894,14 @@ int main()
     testReset();
     testSmallImage();
     testConfig();
+    testSnrSweepTranslation();
+    testUniformIntensityChange();
+    testPixelNoise();
+    testSeeingChange();
+    testSnrSweepWithRotation();
+    testTranslationMagnitudeSweep();
+    testTranslationDirections();
+    testStarDensity();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
