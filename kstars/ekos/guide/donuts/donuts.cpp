@@ -55,15 +55,18 @@ static FrameStats computeStats(const double *buf, int n)
     }
     double stddev = (n > 1) ? std::sqrt(m2 / (n - 1)) : 0.0;
 
-    // Median via nth_element on a subsample (capped at 64 K for speed).
+    // 1st-percentile sky background via nth_element on a subsample (capped at 64 K).
+    // Using the dimmest 1% rather than the median matches McCormac 2013 and avoids
+    // overestimating background in dense star fields where the median is pulled up
+    // by stellar flux.
     const int SAMPLE = std::min(n, 65536);
     std::vector<double> sample(SAMPLE);
     double step = static_cast<double>(n) / SAMPLE;
     for (int i = 0; i < SAMPLE; ++i)
         sample[i] = buf[static_cast<int>(i * step)];
-    auto mid = sample.begin() + SAMPLE / 2;
-    std::nth_element(sample.begin(), mid, sample.end());
-    double median = *mid;
+    auto p1 = sample.begin() + SAMPLE / 100;
+    std::nth_element(sample.begin(), p1, sample.end());
+    double median = *p1;
 
     return { median, stddev, maxVal * 0.95 };
 }
