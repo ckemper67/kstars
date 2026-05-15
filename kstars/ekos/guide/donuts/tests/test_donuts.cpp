@@ -469,7 +469,7 @@ static void testConfig()
 }
 
 // ---------------------------------------------------------------------------
-// McCormac et al. 2013 (PASP 125, 548) simulation scenario helpers
+// Simulation scenario helpers inspired by McCormac et al. 2013 (PASP 125, 548)
 // ---------------------------------------------------------------------------
 
 // Minimal Box-Muller RNG (no stdlib dependency)
@@ -543,7 +543,7 @@ static std::vector<double> gaussianBlur(
 }
 
 // ---------------------------------------------------------------------------
-// McCormac 2013 ss3.5: S/N sweep (translation)
+// S/N sweep analog (inspired by McCormac 2013 s3.5, adapted for 4-quadrant)
 // ---------------------------------------------------------------------------
 // The paper created 50x50 single-star stamps; we use a 256x256 multi-star
 // field because our 4-quadrant solver needs spatial coverage.  Noise is
@@ -609,7 +609,7 @@ static void testSnrSweepTranslation()
 }
 
 // ---------------------------------------------------------------------------
-// McCormac 2013 Fig 1 (blue): uniform intensity change robustness
+// Uniform intensity change robustness (analog of McCormac 2013 Fig. 1 blue)
 // ---------------------------------------------------------------------------
 // The overall comparison-frame flux is scaled uniformly.  Phase-only
 // cross-correlation normalises spectral amplitude, so this should have
@@ -645,7 +645,7 @@ static void testUniformIntensityChange()
 }
 
 // ---------------------------------------------------------------------------
-// McCormac 2013 Fig 1 (green): per-pixel multiplicative noise robustness
+// Per-pixel multiplicative noise robustness (analog of McCormac 2013 Fig. 1 green)
 // ---------------------------------------------------------------------------
 // Each comparison pixel is randomly scaled by N(1, 0.20), matching the
 // paper's "standard deviation of 1 from +-20% of the intensity modified
@@ -680,7 +680,7 @@ static void testPixelNoise()
 }
 
 // ---------------------------------------------------------------------------
-// McCormac 2013 ss3.6: seeing change robustness
+// Seeing change robustness (analog of McCormac 2013 s3.6 / Table 4)
 // ---------------------------------------------------------------------------
 // Reference is in focus (FWHM = 2.5 px).  Comparison frames are Gaussian-
 // blurred to simulate seeing deterioration (0-125% FWHM increase), then
@@ -735,7 +735,7 @@ static void testSeeingChange()
 }
 
 // ---------------------------------------------------------------------------
-// McCormac 2013 extension: S/N sweep with rotation
+// S/N sweep with rotation (4-quadrant extension, not from McCormac 2013)
 // ---------------------------------------------------------------------------
 // Same noise model as testSnrSweepTranslation but the comparison frame also
 // carries a small rotation (0.3 deg).  At high S/N all three DoFs should

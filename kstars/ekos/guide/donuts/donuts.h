@@ -11,7 +11,7 @@
 // Departs from the original in three ways:
 //   - 4-quadrant profile split instead of single full-frame projections
 //   - Phase-only correlation (Kuglin & Hines 1975) instead of standard cross-correlation
-//   - Weighted least-squares solver for rotation (dtheta) in addition to translation
+//   - WLS solver for rotation (dtheta) and optionally isotropic scale in addition to translation
 // No Qt, no FITSData, no pocketfft in this header.
 
 namespace Donuts
