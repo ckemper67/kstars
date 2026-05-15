@@ -1,5 +1,5 @@
 /*
-    SPDX-FileCopyrightText: 2024 Christian Kemper <ckemper@gmail.com>
+    SPDX-FileCopyrightText: 2026 Christian Kemper <ckemper@gmail.com>
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -40,17 +40,18 @@ struct FrameStats
 // Statistics
 // ---------------------------------------------------------------------------
 
-static FrameStats computeStats(const double *buf, int n, double clipSigmas)
+static FrameStats computeStats(const double *buf, int n)
 {
     if (n <= 0) return {};
 
-    // Welford one-pass mean + variance for stddev.
-    double mean = 0, m2 = 0;
+    // Welford one-pass mean + variance for stddev; track max for clip.
+    double mean = 0, m2 = 0, maxVal = 0;
     for (int i = 0; i < n; ++i)
     {
         double delta = buf[i] - mean;
         mean += delta / (i + 1);
         m2   += delta * (buf[i] - mean);
+        if (buf[i] > maxVal) maxVal = buf[i];
     }
     double stddev = (n > 1) ? std::sqrt(m2 / (n - 1)) : 0.0;
 
@@ -64,7 +65,7 @@ static FrameStats computeStats(const double *buf, int n, double clipSigmas)
     std::nth_element(sample.begin(), mid, sample.end());
     double median = *mid;
 
-    return { median, stddev, median + clipSigmas * stddev };
+    return { median, stddev, maxVal * 0.95 };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +121,16 @@ static std::pair<double, double> correlate(
     {
         cp[i] = cf[i] * std::conj(rf[i]);
         double m = std::abs(cp[i]);
-        double filter = (static_cast<double>(i) < rf.size() * lpCutoff) ? 1.0 : 0.0;
+        const double k_full = rf.size() * lpCutoff * 0.9;
+        const double k_cut  = rf.size() * lpCutoff;
+        double ki = static_cast<double>(i);
+        double filter;
+        if (ki <= k_full)
+            filter = 1.0;
+        else if (ki >= k_cut)
+            filter = 0.0;
+        else
+            filter = 0.5 * (1.0 + std::cos(M_PI * (ki - k_full) / (k_cut - k_full)));
         if (m > 1e-9) cp[i] = (cp[i] / m) * filter;
     }
 
@@ -191,9 +201,10 @@ static Profiles buildProfiles(
 
 struct Guider::Impl
 {
-    Config   cfg;
-    Profiles refProfiles;
-    bool     hasRef { false };
+    Config     cfg;
+    Profiles   refProfiles;
+    FrameStats refStats;
+    bool       hasRef { false };
 };
 
 Guider::Guider(Config cfg)
@@ -206,16 +217,15 @@ Guider::~Guider() = default;
 
 void Guider::setReference(const double *pixels, int width, int height)
 {
-    auto stats = computeStats(pixels, width * height, m_impl->cfg.clipSigmas);
-    m_impl->refProfiles = buildProfiles(pixels, width, height, stats, m_impl->cfg);
+    m_impl->refStats    = computeStats(pixels, width * height);
+    m_impl->refProfiles = buildProfiles(pixels, width, height, m_impl->refStats, m_impl->cfg);
     m_impl->hasRef = true;
 }
 
 Transform Guider::measure(const double *pixels, int width, int height)
 {
     if (!m_impl->hasRef) return {};
-    auto stats = computeStats(pixels, width * height, m_impl->cfg.clipSigmas);
-    auto curr  = buildProfiles(pixels, width, height, stats, m_impl->cfg);
+    auto curr = buildProfiles(pixels, width, height, m_impl->refStats, m_impl->cfg);
 
     auto rx = correlate(m_impl->refProfiles.xProf, curr.xProf,
                         m_impl->cfg.tukeyAlpha, m_impl->cfg.lpCutoff);
