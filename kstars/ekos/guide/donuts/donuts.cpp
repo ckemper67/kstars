@@ -260,17 +260,61 @@ static ProfileSet buildProfiles(
 }
 
 // ---------------------------------------------------------------------------
-// Weighted least-squares 3-DoF solver
+// Weighted least-squares solver (3-DoF or 4-DoF)
 // ---------------------------------------------------------------------------
+
+// Gaussian elimination with partial pivoting on a 4x5 augmented matrix [A|b].
+// Solutions land in column 4.  Returns false if singular.
+static bool gaussElim4(double A[4][5])
+{
+    for (int col = 0; col < 4; ++col)
+    {
+        int pivot = col;
+        for (int row = col + 1; row < 4; ++row)
+            if (std::abs(A[row][col]) > std::abs(A[pivot][col]))
+                pivot = row;
+        if (std::abs(A[pivot][col]) < 1e-12) return false;
+        if (pivot != col)
+            for (int j = col; j < 5; ++j) std::swap(A[pivot][j], A[col][j]);
+
+        double inv = 1.0 / A[col][col];
+        for (int row = col + 1; row < 4; ++row)
+        {
+            double f = A[row][col] * inv;
+            for (int j = col; j < 5; ++j) A[row][j] -= f * A[col][j];
+        }
+    }
+    for (int row = 3; row >= 0; --row)
+    {
+        A[row][4] /= A[row][row];
+        for (int r = 0; r < row; ++r) A[r][4] -= A[r][row] * A[row][4];
+    }
+    return true;
+}
 
 static Transform solveTransform(
     const ProfileSet &refP, const ProfileSet &currP, const Config &cfg)
 {
     Transform result;
 
-    double m11 = 0, m13 = 0, m22 = 0, m23 = 0;
-    double m33 = cfg.tikhonov;
-    double b1  = 0, b2  = 0, b3  = 0;
+    // Accumulate normal-equation terms for unknowns [dx, dy, ds, dtheta].
+    // Observation model (small-angle, isotropic scale ds = scale - 1):
+    //   x-shift[i] =  dx  +  ds * xi  -  dtheta * yi   (weight wx = SNR_x^2)
+    //   y-shift[i] =  dy  +  ds * yi  +  dtheta * xi   (weight wy = SNR_y^2)
+    double m_xx = 0;              // sum(wx)
+    double m_yy = 0;              // sum(wy)
+    double m_xs = 0;              // sum(wx * xi)           -- dx-ds coupling
+    double m_xt = 0;              // sum(-wx * yi)          -- dx-dtheta coupling
+    double m_ys = 0;              // sum(wy * yi)           -- dy-ds coupling
+    double m_yt = 0;              // sum(wy * xi)           -- dy-dtheta coupling
+    double m_ss = cfg.tikhonov;  // sum(wx*xi^2 + wy*yi^2) -- ds-ds (regularised)
+    double m_st = 0;              // sum(xi*yi*(wy - wx))   -- ds-dtheta coupling
+    double m_tt = cfg.tikhonov;  // sum(wx*yi^2 + wy*xi^2) -- dtheta-dtheta (regularised)
+    double b_x  = 0;              // sum(wx * rx)
+    double b_y  = 0;              // sum(wy * ry)
+    double b_s  = 0;              // sum(wx*xi*rx + wy*yi*ry)
+    double b_t  = 0;              // sum(-wx*yi*rx + wy*xi*ry)
+
     double minSNR = std::numeric_limits<double>::max();
 
     for (int i = 0; i < 4; ++i)
@@ -287,41 +331,81 @@ static Transform solveTransform(
         const double wx = rx.second * rx.second;
         const double wy = ry.second * ry.second;
 
-        m11 += wx;
-        m13 += -yi * wx;        // coupling: x-shift <- rotation via y-lever-arm
-        m22 += wy;
-        m23 += xi * wy;         // coupling: y-shift <- rotation via x-lever-arm
-        m33 += (yi * yi * wx) + (xi * xi * wy);
-        b1  += rx.first * wx;
-        b2  += ry.first * wy;
-        b3  += (-yi * rx.first * wx) + (xi * ry.first * wy);
+        m_xx += wx;
+        m_xs += wx * xi;
+        m_xt += -wx * yi;
+        m_yy += wy;
+        m_ys += wy * yi;
+        m_yt += wy * xi;
+        m_ss += wx * xi * xi + wy * yi * yi;
+        m_st += xi * yi * (wy - wx);
+        m_tt += wx * yi * yi + wy * xi * xi;
+        b_x  += rx.first * wx;
+        b_y  += ry.first * wy;
+        b_s  += wx * xi * rx.first + wy * yi * ry.first;
+        b_t  += -wx * yi * rx.first + wy * xi * ry.first;
     }
 
     result.snr = minSNR;
 
-    // Schur complement of the rotation DoF: measures how much independent
-    // rotation signal the quadrant lever arms provide.  When guide stars
-    // cluster near the image center the centroids (xi, yi) -> 0, m13 and m23
-    // -> 0, and s33 approaches the Tikhonov floor -- rotation is unobservable.
-    // Fall back to a 2-DoF solve rather than letting noise dominate dtheta and
-    // bleed into dx/dy through the coupling terms.
-    const double s33 = m33
-        - (m11 > 1e-9 ? m13 * m13 / m11 : 0.0)
-        - (m22 > 1e-9 ? m23 * m23 / m22 : 0.0);
-
-    if (s33 < 1e-4 * std::max(m11, m22))
+    // Lever-arm power: signal available for estimating scale and rotation.
+    // When guide stars cluster near the image center (xi, yi -> 0) these DoF
+    // become unobservable and approach the Tikhonov floor.  Fall back to a
+    // 2-DoF (translation-only) solve to avoid noise bleeding into dx/dy.
+    const double leverPower = m_ss - cfg.tikhonov;  // accumulated star signal
+    if (leverPower < 1e-4 * std::max(m_xx, m_yy))
     {
-        result.dx     = (m11 > 1e-9) ? b1 / m11 : 0.0;
-        result.dy     = (m22 > 1e-9) ? b2 / m22 : 0.0;
+        result.dx = (m_xx > 1e-9) ? b_x / m_xx : 0.0;
+        result.dy = (m_yy > 1e-9) ? b_y / m_yy : 0.0;
         return result;
     }
 
-    const double det = m11 * (m22 * m33 - m23 * m23) - m13 * (m22 * m13);
+    if (cfg.detectScale)
+    {
+        // 4-DoF solve: [dx, dy, ds, dtheta] from the 8 quadrant profile shifts.
+        // The observation model is exact -- each quadrant's profile shift equals
+        // the flux-weighted average displacement at that quadrant's centroid.
+        // Normal equations (symmetric, Tikhonov absorbed into m_ss/m_tt):
+        //   [ m_xx   0     m_xs  m_xt ] [dx]     [b_x]
+        //   [ 0      m_yy  m_ys  m_yt ] [dy]  =  [b_y]
+        //   [ m_xs   m_ys  m_ss  m_st ] [ds]     [b_s]
+        //   [ m_xt   m_yt  m_st  m_tt ] [dθ]     [b_t]
+        double A[4][5] = {
+            { m_xx,  0,     m_xs,  m_xt,  b_x },
+            { 0,     m_yy,  m_ys,  m_yt,  b_y },
+            { m_xs,  m_ys,  m_ss,  m_st,  b_s },
+            { m_xt,  m_yt,  m_st,  m_tt,  b_t },
+        };
+        if (gaussElim4(A))
+        {
+            result.dx     = A[0][4];
+            result.dy     = A[1][4];
+            result.scale  = 1.0 + A[2][4];
+            result.dtheta = A[3][4];
+        }
+        return result;
+    }
+
+    // 3-DoF solve (Cramer's rule on [dx, dy, dtheta]).
+    // The Schur complement s33 measures how much independent rotation signal
+    // the quadrant lever arms provide after projecting out translation.
+    const double s33 = m_tt
+        - (m_xx > 1e-9 ? m_xt * m_xt / m_xx : 0.0)
+        - (m_yy > 1e-9 ? m_yt * m_yt / m_yy : 0.0);
+
+    if (s33 < 1e-4 * std::max(m_xx, m_yy))
+    {
+        result.dx = (m_xx > 1e-9) ? b_x / m_xx : 0.0;
+        result.dy = (m_yy > 1e-9) ? b_y / m_yy : 0.0;
+        return result;
+    }
+
+    const double det = m_xx * (m_yy * m_tt - m_yt * m_yt) - m_xt * (m_yy * m_xt);
     if (std::abs(det) < 1e-9) return result;
 
-    result.dx     = (b1 * (m22 * m33 - m23 * m23) + m13 * (b2 * m23 - b3 * m22)) / det;
-    result.dy     = (b2 * (m11 * m33 - m13 * m13) + m23 * (b1 * m13 - b3 * m11)) / det;
-    result.dtheta = (m11 * (m22 * b3 - b2 * m23) + m13 * (0.0 - b1 * m22))       / det;
+    result.dx     = (b_x * (m_yy * m_tt - m_yt * m_yt) + m_xt * (b_y * m_yt - b_t * m_yy)) / det;
+    result.dy     = (b_y * (m_xx * m_tt - m_xt * m_xt) + m_yt * (b_x * m_xt - b_t * m_xx)) / det;
+    result.dtheta = (m_xx * (m_yy * b_t - b_y * m_yt)  - m_xt * b_x * m_yy)                 / det;
     return result;
 }
 

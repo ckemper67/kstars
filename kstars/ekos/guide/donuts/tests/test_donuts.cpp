@@ -72,6 +72,31 @@ static std::vector<double> makeFrame(int w, int h,
     return buf;
 }
 
+// Scale a frame by factor s around the image centre using bilinear interpolation.
+static std::vector<double> scaleFrame(
+    const std::vector<double> &src, int w, int h, double s)
+{
+    std::vector<double> dst(w * h, 0.0);
+    const double cx = w / 2.0, cy = h / 2.0;
+    const double inv_s = 1.0 / s;
+
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            double x2 = (x - cx) * inv_s + cx;
+            double y2 = (y - cy) * inv_s + cy;
+            if (x2 >= 0 && x2 < w - 1 && y2 >= 0 && y2 < h - 1)
+            {
+                int    ix = static_cast<int>(x2), iy = static_cast<int>(y2);
+                double fx = x2 - ix, fy = y2 - iy;
+                dst[y * w + x] =
+                    (1-fx)*(1-fy) * src[iy*w+ix  ]   + fx*(1-fy) * src[iy*w+ix+1] +
+                    (1-fx)*fy     * src[(iy+1)*w+ix ] + fx*fy     * src[(iy+1)*w+ix+1];
+            }
+        }
+    return dst;
+}
+
 // Apply a rigid-body transform (rotate around centre, then translate)
 // to src and write the result into dst using bilinear interpolation.
 static std::vector<double> transformFrame(
@@ -881,6 +906,54 @@ static void testStarDensity()
 // main
 // ---------------------------------------------------------------------------
 
+static void testScaleDetection()
+{
+    // 512x512 gives quadrant centroids at ~128px, doubling the scale lever arm
+    // vs. 256x256 and halving the scale estimation error.
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 20, 42u);
+    for (auto &s : stars) s.peak = 30000.0;
+
+    Donuts::Config cfg;
+    cfg.detectScale = true;
+    Donuts::Guider guider(cfg);
+
+    std::vector<double> ref = makeFrame(W, H, stars, 1000.0, 2.5);
+    guider.setReference(ref.data(), W, H);
+
+    // Pure scale: realistic focus-drift range is sub-0.5% per session.
+    // At 1% the linear centroid model introduces ~0.2px coupling into dx, which
+    // is expected and acceptable (1% scale = ~10mm defocus at f=1000mm; stars
+    // are unusable long before that level).
+    std::printf("--- testScaleDetection ---\n");
+    std::printf("  scale   got_dx   got_dy  got_scale  scale_err\n");
+    const double scales[] = { 0.995, 0.998, 1.0, 1.002, 1.005 };
+    for (double s : scales)
+    {
+        auto frame = scaleFrame(ref, W, H, s);
+        auto t = guider.measure(frame.data(), W, H);
+        std::printf("  %.3f  %7.4f  %7.4f  %9.6f  %9.6f\n",
+                    s, t.dx, t.dy, t.scale, t.scale - s);
+        CHECK(t.valid());
+        CHECK_NEAR(t.dx,    0.0, 0.15);   // <0.15px bleedthrough within 0.5% scale range
+        CHECK_NEAR(t.dy,    0.0, 0.15);
+        CHECK_NEAR(t.scale, s,   0.002);  // scale accurate to 0.2% at 512x512
+    }
+
+    // Scale + translation: the two DoF must not bleed into each other.
+    {
+        const double TX = 3.0, TY = -2.0, S = 1.008;
+        auto frame = scaleFrame(ref, W, H, S);
+        // Apply translation on top of scale.
+        frame = transformFrame(frame, W, H, TX, TY, 0.0);
+        auto t = guider.measure(frame.data(), W, H);
+        CHECK(t.valid());
+        CHECK_NEAR(t.dx,    TX, 0.2);
+        CHECK_NEAR(t.dy,    TY, 0.2);
+        CHECK_NEAR(t.scale, S,  0.004);
+    }
+}
+
 int main()
 {
     testPureTranslation();
@@ -902,6 +975,7 @@ int main()
     testTranslationMagnitudeSweep();
     testTranslationDirections();
     testStarDensity();
+    testScaleDetection();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
