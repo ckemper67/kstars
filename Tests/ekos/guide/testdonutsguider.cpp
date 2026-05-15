@@ -161,7 +161,13 @@ TestDonutsGuider::Buffer TestDonutsGuider::transformBuffer(
     return dst;
 }
 
-// File-scope helper: N Gaussian stars at pseudo-random positions.
+// ---------------------------------------------------------------------------
+// Translation-only characterisation tests
+// Ported from kstars/ekos/guide/donuts/tests/test_donuts.cpp
+// ---------------------------------------------------------------------------
+
+// Generate a frame with N Gaussian stars at pseudo-random positions.
+// Simpler than makeStarField: no fixed layout, seed controls reproducibility.
 static std::vector<double> makeRandomField(int w, int h, int count, uint32_t seed)
 {
     std::vector<double> buf(w * h, 100.0);
@@ -171,10 +177,10 @@ static std::vector<double> makeRandomField(int w, int h, int count, uint32_t see
         return (s & 0xFFFFu) / 65536.0;
     };
 
-    const double margin  = 20.0;
-    const double psf_sig = 2.5;
-    const double inv2s2  = 1.0 / (2.0 * psf_sig * psf_sig);
-    const int    radius  = static_cast<int>(4 * psf_sig) + 1;
+    const double margin   = 20.0;
+    const double psf_sig  = 2.5;
+    const double inv2s2   = 1.0 / (2.0 * psf_sig * psf_sig);
+    const int    radius   = static_cast<int>(4 * psf_sig) + 1;
 
     for (int i = 0; i < count; ++i)
     {
@@ -193,11 +199,6 @@ static std::vector<double> makeRandomField(int w, int h, int count, uint32_t see
     }
     return buf;
 }
-
-// ---------------------------------------------------------------------------
-// Translation-only characterisation tests
-// Ported from kstars/ekos/guide/donuts/tests/test_donuts.cpp
-// ---------------------------------------------------------------------------
 
 void TestDonutsGuider::testTranslationMagnitudeSweep()
 {
