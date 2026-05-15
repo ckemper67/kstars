@@ -7,7 +7,10 @@
 #pragma once
 #include <memory>
 
-// Public API for the DONUTS translation guiding algorithm.
+// Translation guider inspired by DONUTS (McCormac et al. 2013, PASP 125, 548).
+// Departs from the original in one way: uses phase-only correlation
+// (Kuglin & Hines 1975) instead of standard cross-correlation.
+// Otherwise follows the full-frame 1-D projection approach of the paper.
 // No Qt, no FITSData, no pocketfft in this header.
 
 namespace Donuts
@@ -31,7 +34,7 @@ struct Transform
     bool valid() const { return snr >= 3.0; }
 };
 
-// 2-DoF translation guider using global 1-D phase correlation.
+// 2-DoF translation guider using full-frame 1-D phase-only correlation.
 // Not thread-safe; use external locking when sharing across threads.
 class Guider
 {
