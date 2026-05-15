@@ -13,7 +13,6 @@
 #include <complex>
 #include <cmath>
 #include <algorithm>
-#include <numeric>
 #include <limits>
 #include <utility>
 #include <cstddef>
@@ -78,6 +77,8 @@ static FrameStats computeStats(const double *buf, int n)
     std::nth_element(sample.begin(), p1, sample.end());
     double median = *p1;
 
+    // Clip at 95% of the image maximum so that bright stars dominate
+    // phase correlation without including saturated pixels.
     return { median, stddev, maxVal * 0.95 };
 }
 
