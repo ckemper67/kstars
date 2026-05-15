@@ -167,7 +167,8 @@ static void testSubPixelTranslation()
                 t.dx, t.dy, t.snr);
 
     CHECK(t.valid());
-    // Hann roll-off slightly attenuates high-frequency content; widen tolerance.
+    // Hann LP roll-off attenuates the high-frequency band that determines
+    // sub-pixel accuracy; 0.15 px matches the combined-transform tolerance.
     CHECK_NEAR(t.dx,  0.7, 0.15);
     CHECK_NEAR(t.dy, -0.4, 0.15);
 }

@@ -77,8 +77,10 @@ static FrameStats computeStats(const double *buf, int n)
     std::nth_element(sample.begin(), p1, sample.end());
     double median = *p1;
 
-    // Clip at 95% of the image maximum so that bright stars dominate
-    // phase correlation without including saturated pixels.
+    // Clip at 95% of the frame maximum.  Using the observed max (rather than a
+    // dtype constant) means the clip is set once from the reference frame and
+    // reused for all subsequent measure() calls, so the same star is clipped
+    // identically in both the reference and current profiles.
     return { median, stddev, maxVal * 0.95 };
 }
 
@@ -131,12 +133,17 @@ static std::pair<double, double> correlate(
     r2c(shape, si, sc, 0, FORWARD, r.data(), rf.data(), 1.0);
     r2c(shape, si, sc, 0, FORWARD, c.data(), cf.data(), 1.0);
 
+    // Phase correlation with Hann roll-off low-pass filter.
+    // A rectangular cutoff produces sinc sidelobes in the correlation output
+    // that can become false peaks in sparse-star quadrants.  A Hann-shaped
+    // roll-off eliminates the Gibbs phenomenon while preserving the passband.
+    const double k_full = rf.size() * lpCutoff * 0.9;  // flat region
+    const double k_cut  = rf.size() * lpCutoff;         // zero from here
+
     for (std::size_t i = 0; i < rf.size(); ++i)
     {
         cp[i] = cf[i] * std::conj(rf[i]);
         double m = std::abs(cp[i]);
-        const double k_full = rf.size() * lpCutoff * 0.9;
-        const double k_cut  = rf.size() * lpCutoff;
         double ki = static_cast<double>(i);
         double filter;
         if (ki <= k_full)
@@ -145,6 +152,7 @@ static std::pair<double, double> correlate(
             filter = 0.0;
         else
             filter = 0.5 * (1.0 + std::cos(M_PI * (ki - k_full) / (k_cut - k_full)));
+
         if (m > 1e-9) cp[i] = (cp[i] / m) * filter;
     }
 
@@ -280,9 +288,9 @@ static Transform solveTransform(
         const double wy = ry.second * ry.second;
 
         m11 += wx;
-        m13 += -yi * wx;
+        m13 += -yi * wx;        // coupling: x-shift <- rotation via y-lever-arm
         m22 += wy;
-        m23 += xi * wy;
+        m23 += xi * wy;         // coupling: y-shift <- rotation via x-lever-arm
         m33 += (yi * yi * wx) + (xi * xi * wy);
         b1  += rx.first * wx;
         b2  += ry.first * wy;
@@ -290,6 +298,23 @@ static Transform solveTransform(
     }
 
     result.snr = minSNR;
+
+    // Schur complement of the rotation DoF: measures how much independent
+    // rotation signal the quadrant lever arms provide.  When guide stars
+    // cluster near the image center the centroids (xi, yi) -> 0, m13 and m23
+    // -> 0, and s33 approaches the Tikhonov floor -- rotation is unobservable.
+    // Fall back to a 2-DoF solve rather than letting noise dominate dtheta and
+    // bleed into dx/dy through the coupling terms.
+    const double s33 = m33
+        - (m11 > 1e-9 ? m13 * m13 / m11 : 0.0)
+        - (m22 > 1e-9 ? m23 * m23 / m22 : 0.0);
+
+    if (s33 < 1e-4 * std::max(m11, m22))
+    {
+        result.dx     = (m11 > 1e-9) ? b1 / m11 : 0.0;
+        result.dy     = (m22 > 1e-9) ? b2 / m22 : 0.0;
+        return result;
+    }
 
     const double det = m11 * (m22 * m33 - m23 * m23) - m13 * (m22 * m13);
     if (std::abs(det) < 1e-9) return result;
@@ -308,7 +333,7 @@ struct Guider::Impl
 {
     Config     cfg;
     ProfileSet refProfiles;
-    FrameStats refStats;
+    FrameStats refStats;   // locked at setReference() time; reused by measure()
     bool       hasRef { false };
 };
 
@@ -324,12 +349,14 @@ void Guider::setReference(const double *pixels, int width, int height)
 {
     m_impl->refStats    = computeStats(pixels, width * height);
     m_impl->refProfiles = buildProfiles(pixels, width, height, m_impl->refStats, m_impl->cfg);
-    m_impl->hasRef = true;
+    m_impl->hasRef      = true;
 }
 
 Transform Guider::measure(const double *pixels, int width, int height)
 {
     if (!m_impl->hasRef) return {};
+    // Reuse reference-frame stats so threshold and clip are identical for both
+    // frames -- prevents background changes from causing systematic drift.
     auto curr = buildProfiles(pixels, width, height, m_impl->refStats, m_impl->cfg);
     return solveTransform(m_impl->refProfiles, curr, m_impl->cfg);
 }
@@ -337,7 +364,8 @@ Transform Guider::measure(const double *pixels, int width, int height)
 void Guider::reset()
 {
     m_impl->refProfiles = ProfileSet{};
-    m_impl->hasRef = false;
+    m_impl->refStats    = FrameStats{};
+    m_impl->hasRef      = false;
 }
 
 bool Guider::hasReference() const

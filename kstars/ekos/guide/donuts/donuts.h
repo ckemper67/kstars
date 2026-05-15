@@ -31,7 +31,9 @@ struct Transform
 {
     double dx     = 0;  // x translation in pixels (positive = right)
     double dy     = 0;  // y translation in pixels (positive = down)
-    double dtheta = 0;  // rotation in radians (positive = CCW)
+    double dtheta = 0;  // rotation in radians; positive = CCW in math coords (y-up),
+                        // which is visually CW on screen (y-down image coords).
+                        // Wire to a rotator with the appropriate sign for your mount.
     double snr    = 0;  // minimum per-quadrant correlation SNR (< 3 = unreliable)
 
     bool valid() const { return snr >= 3.0; }
