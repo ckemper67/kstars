@@ -4,6 +4,7 @@ if(NOT APPLE) #This is not needed on MacOS, since the data directory and icons a
 endif(NOT APPLE)
 
 add_subdirectory( htmesh )
+add_subdirectory( ekos/guide/donuts )
 
 if (ANDROID AND CMAKE_TOOLCHAIN_FILE)
     include(${CMAKE_TOOLCHAIN_FILE})
@@ -391,7 +392,8 @@ if (INDI_FOUND)
             # Internal Guide
             ekos/guide/internalguide/gmath.cpp
             ekos/guide/internalguide/guidealgorithms.cpp
-            ekos/guide/internalguide/calibrationprocess.cpp
+            ekos/guide/internalguide/donutsguider.cpp
+    ekos/guide/internalguide/calibrationprocess.cpp
             ekos/guide/internalguide/internalguider.cpp
             ekos/guide/internalguide/matr.cpp
             ekos/guide/internalguide/vect.cpp
@@ -1377,6 +1379,7 @@ IF (NOT ANDROID)
     generate_export_header(KStarsLib)
 
     target_link_libraries(KStarsLib
+        donuts
         LibKSDataHandlers
         htmesh
         Qt::Gui
