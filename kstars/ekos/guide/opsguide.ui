@@ -629,6 +629,11 @@
             <string>SEP Multi Star (recommended)</string>
            </property>
           </item>
+          <item>
+           <property name="text">
+            <string>DONUTS</string>
+           </property>
+          </item>
          </widget>
         </item>
         <item row="0" column="0">
