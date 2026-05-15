@@ -32,6 +32,8 @@ class GuideLog;
 class LinearGuider;
 class HysteresisGuider;
 
+#include "donutsguider.h"
+
 // For now also copied in guidealgorithms.cpp
 #define SMART_THRESHOLD    0
 #define SEP_THRESHOLD      1
@@ -39,6 +41,7 @@ class HysteresisGuider;
 #define AUTO_THRESHOLD     3
 #define NO_THRESHOLD       4
 #define SEP_MULTISTAR      5
+#define DONUTS_ALGORITHM   6
 
 #define GUIDE_RA    0
 #define GUIDE_DEC   1
@@ -156,7 +159,6 @@ class cgmath : public QObject
     Q_SIGNALS:
         void newAxisDelta(double delta_ra, double delta_dec);
         void newStarPosition(QVector3D, bool);
-
         // For Analyze.
         void guideStats(double raError, double decError, int raPulse, int decPulse,
                         double snr, double skyBg, int numStars);
@@ -228,4 +230,9 @@ class cgmath : public QObject
         void updateOutParams(int k, const double arcsecDrift, int pulseLength, GuideDirection pulseDirection);
         void outputGuideLog();
         void processAxis(const int k, const bool dithering, const bool darkGuiding, const Seconds &timeStep, const QString &label);
+
+        Ekos::DonutsGuider &getDonutsGuider() { return m_DonutsGuider; }
+
+    private:
+        Ekos::DonutsGuider m_DonutsGuider;
 };

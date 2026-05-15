@@ -8,6 +8,7 @@
 */
 
 #include "gmath.h"
+#include "ekos/guide/donuts/donuts.h"
 
 #include "Options.h"
 #include "fitsviewer/fitsdata.h"
@@ -31,7 +32,27 @@ GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imag
         QSharedPointer<GuideView> &guideView, bool firstFrame)
 {
     GuiderUtils::Vector position;
-    if (usingSEPMultiStar())
+    
+    if (m_StarDetectionAlgorithm == DONUTS_ALGORITHM)
+    {
+        if (firstFrame || !m_DonutsGuider.hasReference())
+        {
+            m_DonutsGuider.setReference(imageData);
+            // Return image center so targetPosition is set to a valid non-zero coordinate.
+            // On subsequent frames, drift = position - targetPosition, which starts at zero.
+            return GuiderUtils::Vector(imageData->width() / 2.0, imageData->height() / 2.0, 0);
+        }
+        
+        Donuts::Transform transform = m_DonutsGuider.calculateTransform(imageData);
+        // Minimum per-quadrant correlation SNR. Below 3 the peak is indistinguishable
+        // from noise and treating it as a lost star is safer than reporting a false drift.
+        if (transform.snr < 3.0)
+            return GuiderUtils::Vector(-1, -1, -1);
+        // Synthesize virtual star position: Target + Measured Drift
+        position.x = targetPosition.x + transform.dx;
+        position.y = targetPosition.y + transform.dy;
+    }
+    else if (usingSEPMultiStar())
     {
         QRect trackingBox = guideView->getTrackingBox();
         position = guideStars.findGuideStar(imageData, trackingBox, guideView, firstFrame);
@@ -169,10 +190,14 @@ bool cgmath::reset()
 
 void cgmath::setStarDetectionAlgorithmIndex(int algorithmIndex)
 {
-    if (algorithmIndex < 0 || algorithmIndex > SEP_MULTISTAR)
+    if (algorithmIndex < 0 || algorithmIndex > DONUTS_ALGORITHM)
         return;
 
-    m_StarDetectionAlgorithm = algorithmIndex;
+    if (m_StarDetectionAlgorithm != algorithmIndex)
+    {
+        m_StarDetectionAlgorithm = algorithmIndex;
+        m_DonutsGuider.reset();
+    }
 }
 
 bool cgmath::usingSEPMultiStar() const
@@ -216,6 +241,7 @@ void cgmath::start()
 void cgmath::abort()
 {
     guideStars.reset();
+    m_DonutsGuider.reset();
     m_RALinearGuider->reset();
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
@@ -225,6 +251,8 @@ void cgmath::abort()
 void cgmath::suspend(bool mode)
 {
     suspended = mode;
+    if (mode)
+        m_DonutsGuider.reset();
     m_RALinearGuider->reset();
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();

@@ -223,6 +223,10 @@ bool InternalGuider::resume()
     state = GUIDE_GUIDING;
     Q_EMIT newStatus(state);
 
+    // Force re-acquisition of the DONUTS reference on the next frame so that any image
+    // shift from a slew or other suspension event is absorbed into the new baseline.
+    m_isFirstFrame = true;
+
     pmath->suspend(false);
 
     startDarkGuiding();
