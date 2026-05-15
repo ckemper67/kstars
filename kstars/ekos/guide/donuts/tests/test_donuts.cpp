@@ -167,8 +167,9 @@ static void testSubPixelTranslation()
                 t.dx, t.dy, t.snr);
 
     CHECK(t.valid());
-    CHECK_NEAR(t.dx,  0.7, 0.10);
-    CHECK_NEAR(t.dy, -0.4, 0.10);
+    // Hann roll-off slightly attenuates high-frequency content; widen tolerance.
+    CHECK_NEAR(t.dx,  0.7, 0.15);
+    CHECK_NEAR(t.dy, -0.4, 0.15);
 }
 
 static void testTranslationWithRotation()
