@@ -1,5 +1,5 @@
 /*
-    SPDX-FileCopyrightText: 2024 Christian Kemper <ckemper@gmail.com>
+    SPDX-FileCopyrightText: 2026 Christian Kemper <ckemper@gmail.com>
 
     SPDX-License-Identifier: GPL-2.0-or-later
 */
@@ -19,7 +19,6 @@ struct Config
     double lpCutoff       = 0.75;  // low-pass cutoff as fraction of Nyquist
     double sigmaThreshold = 3.0;   // pixel selection: median + N * stddev
     double spikeRatio     = 4.0;   // hot-pixel suppression: value > ratio * neighbour avg
-    double clipSigmas     = 20.0;  // saturation clip: median + N * stddev
 };
 
 struct Transform
