@@ -254,6 +254,172 @@ static void testSmallImage()
     CHECK_NEAR(t.dy, -1.0, 0.3);
 }
 
+static void testAltAzNorthPointing()
+{
+    // Alt-az mount guiding near the north celestial pole (NCP).
+    // The NCP is the true rotation pivot: it sits 200 px north of (above) the
+    // guide star, which is at the image center.  As the sky rotates around the
+    // NCP between guide frames, the guide star traces a small eastward arc --
+    // appearing as a westward drift in the sensor combined with field rotation.
+    //
+    // The off-center pivot formula gives the equivalent rigid-body transform:
+    //   pivot at (cx, cy-200), theta = 0.5 deg
+    //   dx = 0*(1-cos) + (-200)*sin = -1.745 px   (guide star drifts west)
+    //   dy = (-200)*(1-cos) - 0*sin = -0.008 px   (negligible N/S component)
+    //
+    // DONUTS should decompose this as:
+    //   dx ~ -1.745 px  ->  guide command: nudge mount east
+    //   dtheta ~ 0.5 deg -> guide command: advance de-rotator
+
+    std::printf("--- testAltAzNorthPointing ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 55);
+    auto ref   = makeFrame(W, H, stars);
+
+    const double cx = W / 2.0, cy = H / 2.0;
+    const double px = cx, py = cy - 200;  // NCP: 200 px north of guide star
+    const double thetaDeg = 0.5;
+    const double cosT = std::cos(thetaDeg * M_PI / 180.0);
+    const double sinT = std::sin(thetaDeg * M_PI / 180.0);
+    const double expectedDx = (px - cx) * (1.0 - cosT) + (py - cy) * sinT;
+    const double expectedDy = (py - cy) * (1.0 - cosT) - (px - cx) * sinT;
+
+    auto curr = transformFrame(ref, W, H, expectedDx, expectedDy, thetaDeg);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+    auto t = g.measure(curr.data(), W, H);
+
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  NCP 200 px north of center, theta=%.1f deg\n", thetaDeg);
+    std::printf("  Expected dx=%.4f dy=%.4f dtheta=%.4f deg\n",
+                expectedDx, expectedDy, thetaDeg);
+    std::printf("  Got     dx=%.4f dy=%.4f dtheta=%.4f deg  SNR=%.1f\n",
+                t.dx, t.dy, deg, t.snr);
+
+    CHECK(t.valid());
+    CHECK_NEAR(t.dx,  expectedDx, 0.15);
+    CHECK_NEAR(t.dy,  expectedDy, 0.15);
+    CHECK_NEAR(deg,   thetaDeg,   0.05);
+}
+
+static void testAltAzMeridianCrossing()
+{
+    // Alt-az mount tracking a star crossing the southern meridian.
+    // Between guide frames two things happen simultaneously:
+    //   1) The mount tracking error lets the guide star drift 2.5 px east and
+    //      1.5 px south.
+    //   2) The de-rotator lags by 0.3 deg of field rotation (CCW).
+    //
+    // The rotation pivot is the guide star's new sensor position (cx+2.5, cy+1.5),
+    // which is off-center by the tracking error.  Rotating around an off-center
+    // pivot is mathematically identical to rotating around the image center then
+    // applying the same translation, so DONUTS decomposes this as:
+    //   dx = 2.5 px   ->  mount correction: nudge west
+    //   dy = 1.5 px   ->  mount correction: nudge north
+    //   dtheta = 0.3 deg -> de-rotator correction
+
+    std::printf("--- testAltAzMeridianCrossing ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 66);
+    auto ref   = makeFrame(W, H, stars);
+
+    const double dx_track = 2.5;   // guide star drifted east
+    const double dy_track = 1.5;   // guide star drifted south (y-down)
+    const double thetaDeg = 0.3;   // de-rotator lag (CCW field rotation)
+
+    auto curr = transformFrame(ref, W, H, dx_track, dy_track, thetaDeg);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+    auto t = g.measure(curr.data(), W, H);
+
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  Guide drift (%.1f, %.1f) px, field rot %.2f deg\n",
+                dx_track, dy_track, thetaDeg);
+    std::printf("  Got: dx=%.4f dy=%.4f dtheta=%.4f deg  SNR=%.1f\n",
+                t.dx, t.dy, deg, t.snr);
+
+    CHECK(t.valid());
+    CHECK_NEAR(t.dx, dx_track, 0.15);
+    CHECK_NEAR(t.dy, dy_track, 0.15);
+    CHECK_NEAR(deg,  thetaDeg, 0.05);
+}
+
+static void testAltAzRising()
+{
+    // Alt-az mount tracking a star in the eastern sky (rising toward meridian).
+    // As the object rises, the parallactic angle increases: the field rotates CCW
+    // (positive dtheta).  The guide star drifts west and north due to imperfect
+    // tracking on the ascending arc.
+    //
+    // Same math as testAltAzMeridianCrossing but with reversed drift direction,
+    // confirming DONUTS correctly measures negative dx/dy offsets.
+
+    std::printf("--- testAltAzRising ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 88);
+    auto ref   = makeFrame(W, H, stars);
+
+    const double dx_track = -2.5;  // guide star drifted west
+    const double dy_track = -1.5;  // guide star drifted north (y-down, so negative)
+    const double thetaDeg =  0.3;  // CCW field rotation (parallactic angle increasing)
+
+    auto curr = transformFrame(ref, W, H, dx_track, dy_track, thetaDeg);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+    auto t = g.measure(curr.data(), W, H);
+
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  Guide drift (%.1f, %.1f) px, field rot %.2f deg\n",
+                dx_track, dy_track, thetaDeg);
+    std::printf("  Got: dx=%.4f dy=%.4f dtheta=%.4f deg  SNR=%.1f\n",
+                t.dx, t.dy, deg, t.snr);
+
+    CHECK(t.valid());
+    CHECK_NEAR(t.dx, dx_track, 0.15);
+    CHECK_NEAR(t.dy, dy_track, 0.15);
+    CHECK_NEAR(deg,  thetaDeg, 0.05);
+}
+
+static void testAltAzSetting()
+{
+    // Alt-az mount tracking a star in the western sky (setting past meridian).
+    // Past the meridian, the parallactic angle decreases: the field rotates CW,
+    // which is a NEGATIVE dtheta in the algorithm's convention.
+    // Guide star drifts east and south as the object descends.
+    //
+    // This is the key case that exercises negative rotation detection -- the
+    // de-rotator must run in reverse compared to the rising-object case.
+
+    std::printf("--- testAltAzSetting ---\n");
+    const int W = 512, H = 512;
+    auto stars = randomStars(W, H, 80, 44);
+    auto ref   = makeFrame(W, H, stars);
+
+    const double dx_track =  2.0;   // guide star drifted east
+    const double dy_track =  1.5;   // guide star drifted south
+    const double thetaDeg = -0.3;   // CW field rotation (parallactic angle decreasing)
+
+    auto curr = transformFrame(ref, W, H, dx_track, dy_track, thetaDeg);
+
+    Donuts::Guider g;
+    g.setReference(ref.data(), W, H);
+    auto t = g.measure(curr.data(), W, H);
+
+    double deg = t.dtheta * 180.0 / M_PI;
+    std::printf("  Guide drift (%.1f, %.1f) px, field rot %.2f deg\n",
+                dx_track, dy_track, thetaDeg);
+    std::printf("  Got: dx=%.4f dy=%.4f dtheta=%.4f deg  SNR=%.1f\n",
+                t.dx, t.dy, deg, t.snr);
+
+    CHECK(t.valid());
+    CHECK_NEAR(t.dx, dx_track, 0.15);
+    CHECK_NEAR(t.dy, dy_track, 0.15);
+    CHECK_NEAR(deg,  thetaDeg, 0.05);
+}
+
 static void testConfig()
 {
     std::printf("--- testConfig (custom tukey alpha) ---\n");
@@ -287,6 +453,10 @@ int main()
     testSubPixelTranslation();
     testPureRotation();
     testCombined();
+    testAltAzNorthPointing();
+    testAltAzMeridianCrossing();
+    testAltAzRising();
+    testAltAzSetting();
     testReset();
     testSmallImage();
     testConfig();

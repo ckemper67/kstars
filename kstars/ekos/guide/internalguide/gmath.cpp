@@ -8,7 +8,6 @@
 */
 
 #include "gmath.h"
-#include "ekos/guide/donuts/donuts.h"
 
 #include "Options.h"
 #include "fitsviewer/fitsdata.h"
@@ -28,6 +27,59 @@
 // Qt version calming
 #include <qtendl.h>
 
+static std::vector<double> donutsToDoubleBuffer(const QSharedPointer<FITSData> &data)
+{
+    const auto   &stats = data->getStatistics();
+    const int     n     = data->width() * data->height();
+    const uint8_t *raw  = data->getImageBuffer();
+    std::vector<double> out(n);
+    switch (stats.dataType)
+    {
+        case TBYTE:
+            for (int i = 0; i < n; ++i) out[i] = raw[i];
+            break;
+        case TSHORT: {
+            const int16_t *buf = reinterpret_cast<const int16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TUSHORT: {
+            const uint16_t *buf = reinterpret_cast<const uint16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONG: {
+            const int32_t *buf = reinterpret_cast<const int32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TULONG: {
+            const uint32_t *buf = reinterpret_cast<const uint32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TFLOAT: {
+            const float *buf = reinterpret_cast<const float *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONGLONG: {
+            const int64_t *buf = reinterpret_cast<const int64_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TDOUBLE: {
+            const double *buf = reinterpret_cast<const double *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        default:
+            qCWarning(KSTARS_EKOS_GUIDE) << "DONUTS: unsupported dataType" << stats.dataType;
+            break;
+    }
+    return out;
+}
+
 GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imageData,
         QSharedPointer<GuideView> &guideView, bool firstFrame)
 {
@@ -37,13 +89,15 @@ GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imag
     {
         if (firstFrame || !m_DonutsGuider.hasReference())
         {
-            m_DonutsGuider.setReference(imageData);
+            auto pixels = donutsToDoubleBuffer(imageData);
+            m_DonutsGuider.setReference(pixels.data(), imageData->width(), imageData->height());
             // Return image center so targetPosition is set to a valid non-zero coordinate.
             // On subsequent frames, drift = position - targetPosition, which starts at zero.
             return GuiderUtils::Vector(imageData->width() / 2.0, imageData->height() / 2.0, 0);
         }
-        
-        Donuts::Transform transform = m_DonutsGuider.calculateTransform(imageData);
+
+        auto pixels = donutsToDoubleBuffer(imageData);
+        Donuts::Transform transform = m_DonutsGuider.measure(pixels.data(), imageData->width(), imageData->height());
         // Minimum per-quadrant correlation SNR. Below 3 the peak is indistinguishable
         // from noise and treating it as a lost star is safer than reporting a false drift.
         if (transform.snr < 3.0)

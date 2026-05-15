@@ -18,7 +18,7 @@ TARGET_LINK_LIBRARIES( testcalibrationprocess ${TEST_LIBRARIES})
 ADD_TEST( NAME CalibrationProcessTest COMMAND testcalibrationprocess )
 SET_TESTS_PROPERTIES( CalibrationProcessTest PROPERTIES LABELS "stable")
 
-ADD_EXECUTABLE( testdonutsguider testdonutsguider.cpp ../../../kstars/ekos/guide/internalguide/donutsguider.cpp )
+ADD_EXECUTABLE( testdonutsguider testdonutsguider.cpp )
 TARGET_LINK_LIBRARIES( testdonutsguider ${TEST_LIBRARIES})
 ADD_TEST( NAME DonutsGuiderTest COMMAND testdonutsguider )
 SET_TESTS_PROPERTIES( DonutsGuiderTest PROPERTIES LABELS "stable")

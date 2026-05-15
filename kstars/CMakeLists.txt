@@ -392,8 +392,7 @@ if (INDI_FOUND)
             # Internal Guide
             ekos/guide/internalguide/gmath.cpp
             ekos/guide/internalguide/guidealgorithms.cpp
-            ekos/guide/internalguide/donutsguider.cpp
-    ekos/guide/internalguide/calibrationprocess.cpp
+            ekos/guide/internalguide/calibrationprocess.cpp
             ekos/guide/internalguide/internalguider.cpp
             ekos/guide/internalguide/matr.cpp
             ekos/guide/internalguide/vect.cpp

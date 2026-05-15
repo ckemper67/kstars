@@ -32,7 +32,7 @@ class GuideLog;
 class LinearGuider;
 class HysteresisGuider;
 
-#include "donutsguider.h"
+#include "ekos/guide/donuts/donuts.h"
 
 // For now also copied in guidealgorithms.cpp
 #define SMART_THRESHOLD    0
@@ -233,8 +233,6 @@ class cgmath : public QObject
         void outputGuideLog();
         void processAxis(const int k, const bool dithering, const bool darkGuiding, const Seconds &timeStep, const QString &label);
 
-        Ekos::DonutsGuider &getDonutsGuider() { return m_DonutsGuider; }
-
     private:
-        Ekos::DonutsGuider m_DonutsGuider;
+        Donuts::Guider m_DonutsGuider;
 };
