@@ -8,6 +8,7 @@
 
 #include <QObject>
 #include <QSharedPointer>
+#include <vector>
 
 class FITSData;
 
@@ -22,7 +23,16 @@ private Q_SLOTS:
     void initTestCase();
     void cleanupTestCase();
     void testMathRecovery();
+    void testTranslationMagnitudeSweep();
+    void testTranslationDirections();
+    void testStarDensity();
 
 private:
+    // FITSData-based helper used by testMathRecovery
     QSharedPointer<FITSData> transformImage(const QSharedPointer<FITSData> &source, double dx, double dy, double dtheta);
+
+    // Synthetic double-buffer helpers used by the translation tests
+    using Buffer = std::vector<double>;
+    static Buffer makeStarField(int w, int h);
+    static Buffer transformBuffer(const Buffer &src, int w, int h, double dx, double dy, double dthetaDeg);
 };
