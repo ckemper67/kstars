@@ -9,6 +9,7 @@
 
 #include "ui_mountmodel.h"
 #include "ekos/ekos.h"
+#include "indi/indistd.h"
 #include "skypoint.h"
 
 #include <QDialog>
@@ -70,6 +71,7 @@ class MountModel : public QDialog, public Ui::mountModel
         void alignTypeChanged(int alignType);
         void togglePreviewAlignPoints();
         void slotSortAlignmentPoints();
+        void onMountParkStatusChanged(ISD::ParkStatus status);
 
 
     private:
@@ -121,6 +123,8 @@ class MountModel : public QDialog, public Ui::mountModel
         bool m_savedUsePosition { false };
         bool m_savedUseScale { false };
         int m_savedGotoMode { 2 };  // Align::GOTO_NOTHING -- safe no-op default
+
+        bool m_WaitingForUnpark { false };
 
 
 };

@@ -531,6 +531,8 @@ void Align::slotMountModel()
     }
 
     m_MountModel->show();
+    m_MountModel->raise();
+    m_MountModel->activateWindow();
 }
 
 
@@ -1916,7 +1918,9 @@ void Align::setCaptureComplete()
 
 void Align::setSolverAction(int mode)
 {
-    gotoModeButtonGroup->button(mode)->setChecked(true);
+    auto *btn = gotoModeButtonGroup->button(mode);
+    if (btn)
+        btn->setChecked(true);
     m_CurrentGotoMode = static_cast<GotoMode>(mode);
 }
 

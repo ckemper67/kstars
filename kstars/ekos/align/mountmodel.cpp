@@ -7,6 +7,7 @@
 #include "mountmodel.h"
 
 #include "align.h"
+#include "indi/indimount.h"
 #include "Options.h"
 #include "kstars.h"
 #include "kstarsdata.h"
@@ -121,7 +122,13 @@ MountModel::MountModel(Align *parent) : QDialog(parent)
 MountModel::~MountModel()
 {
     if (m_solverSettingsSaved)
-        restoreSolverSettings();
+    {
+        // Restore persistent options only -- do not call setSolverAction() here
+        // because Align's child widgets (including the goto button group) may
+        // already be partially destroyed by the time this destructor runs.
+        Options::setAstrometryUsePosition(m_savedUsePosition);
+        Options::setAstrometryUseImageScale(m_savedUseScale);
+    }
 }
 
 void MountModel::generateAlignStarList()
@@ -1106,6 +1113,29 @@ bool MountModel::alignmentPointsAreBad()
     return false;
 }
 
+void MountModel::onMountParkStatusChanged(ISD::ParkStatus status)
+{
+    if (!m_WaitingForUnpark)
+        return;
+
+    auto *mount = m_AlignInstance->mount();
+    if (status == ISD::PARK_UNPARKED)
+    {
+        m_WaitingForUnpark = false;
+        if (mount)
+            disconnect(mount, &ISD::Mount::newParkStatus, this, &MountModel::onMountParkStatusChanged);
+        Q_EMIT newLog(i18n("Mount unparked. Starting mount model..."));
+        startStopAlignmentProcedure();
+    }
+    else if (status == ISD::PARK_ERROR)
+    {
+        m_WaitingForUnpark = false;
+        if (mount)
+            disconnect(mount, &ISD::Mount::newParkStatus, this, &MountModel::onMountParkStatusChanged);
+        Q_EMIT newLog(i18n("Mount unpark failed. Cannot start mount model."));
+    }
+}
+
 void MountModel::startStopAlignmentProcedure()
 {
     if (!m_IsRunning)
@@ -1115,6 +1145,18 @@ void MountModel::startStopAlignmentProcedure()
             if (alignmentPointsAreBad())
             {
                 KSNotification::error(i18n("Please Check the Alignment Points."));
+                return;
+            }
+
+            // Unpark mount before starting if needed
+            auto *mount = m_AlignInstance->mount();
+            if (mount && mount->isParked())
+            {
+                Q_EMIT newLog(i18n("Mount is parked. Unparking before starting mount model..."));
+                m_WaitingForUnpark = true;
+                connect(mount, &ISD::Mount::newParkStatus, this, &MountModel::onMountParkStatusChanged,
+                        Qt::UniqueConnection);
+                mount->unpark();
                 return;
             }
             if (m_AlignInstance->currentGOTOMode() == Align::GOTO_NOTHING)
@@ -1237,6 +1279,11 @@ void MountModel::saveAndOverrideSolverSettings()
     // Only override the goto mode if it is not already GOTO_NOTHING (report-only run)
     if (m_AlignInstance->currentGOTOMode() != Align::GOTO_NOTHING)
         m_AlignInstance->setSolverAction(Align::GOTO_SYNC);
+
+    // Clear any stale target PA from a previous Load & Slew.  If left set,
+    // checkIfRotationRequired() will command the rotator to match it on the
+    // first solve, which is wrong for an independent mount model run.
+    m_AlignInstance->setTargetPositionAngle(std::numeric_limits<double>::quiet_NaN());
 
     emit newLog(i18n("Mount model: forcing blind solve and sync for each alignment point."));
 }
