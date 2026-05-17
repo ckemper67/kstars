@@ -153,6 +153,20 @@ static string readBayerPat(const string &path)
     return pat;
 }
 
+// Pixel positions within a 2x2 Bayer cell, encoded as 0-3:
+//   0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+// row_offset = pos >> 1,  col_offset = pos & 1
+struct BayerLayout { int r, g1, g2, b; };
+
+static bool parseBayerLayout(const string &pat, BayerLayout &bl)
+{
+    if      (pat == "RGGB") { bl = {0, 1, 2, 3}; return true; }
+    else if (pat == "GRBG") { bl = {1, 0, 3, 2}; return true; }
+    else if (pat == "GBRG") { bl = {2, 0, 3, 1}; return true; }
+    else if (pat == "BGGR") { bl = {3, 1, 2, 0}; return true; }
+    return false;
+}
+
 static bool writeFITS(const string &path, const vector<Pix> &pixels, int w, int h)
 {
     fitsfile *fptr = nullptr;
@@ -277,37 +291,44 @@ static vector<double> toDouble(const vector<Pix> &v)
 // Bayer helpers (RGGB, XBAYROFF=0 YBAYROFF=0)
 // ---------------------------------------------------------------------------
 
-static vector<Pix> extractGreen(const vector<Pix> &bayer, int bw, int bh, int &gw, int &gh)
+static vector<Pix> extractGreen(const vector<Pix> &bayer, int bw, int bh,
+                                int &gw, int &gh, const BayerLayout &bl)
 {
     gw = bw / 2;
     gh = bh / 2;
     vector<Pix> green((size_t)gw * gh);
+    const int g1r = bl.g1 >> 1, g1c = bl.g1 & 1;
+    const int g2r = bl.g2 >> 1, g2c = bl.g2 & 1;
     for (int r = 0; r < gh; ++r)
         for (int c = 0; c < gw; ++c)
         {
-            Pix g1 = bayer[(size_t)(2*r)     * bw + (2*c + 1)];
-            Pix g2 = bayer[(size_t)(2*r + 1)  * bw + (2*c)];
+            Pix g1 = bayer[(size_t)(2*r + g1r) * bw + (2*c + g1c)];
+            Pix g2 = bayer[(size_t)(2*r + g2r) * bw + (2*c + g2c)];
             green[(size_t)r * gw + c] = (g1 + g2) * 0.5f;
         }
     return green;
 }
 
-static void debayerRGGB(const vector<Pix> &bayer, int bw, int bh,
-                        vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
-                        int &w, int &h)
+static void debayer(const vector<Pix> &bayer, int bw, int bh,
+                    vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
+                    int &w, int &h, const BayerLayout &bl)
 {
     w = bw / 2;
     h = bh / 2;
     size_t npix = (size_t)w * h;
     r.resize(npix); g.resize(npix); b.resize(npix);
+    const int rr = bl.r  >> 1, rc  = bl.r  & 1;
+    const int g1r= bl.g1 >> 1, g1c = bl.g1 & 1;
+    const int g2r= bl.g2 >> 1, g2c = bl.g2 & 1;
+    const int br = bl.b  >> 1, bc  = bl.b  & 1;
     for (int row = 0; row < h; ++row)
         for (int col = 0; col < w; ++col)
         {
             size_t i = (size_t)row * w + col;
-            r[i] = bayer[(size_t)(2*row)     * bw + (2*col)];
-            g[i] = (bayer[(size_t)(2*row)     * bw + (2*col + 1)] +
-                    bayer[(size_t)(2*row + 1)  * bw + (2*col)]) * 0.5f;
-            b[i] = bayer[(size_t)(2*row + 1)  * bw + (2*col + 1)];
+            r[i] = bayer[(size_t)(2*row + rr)  * bw + (2*col + rc)];
+            g[i] = (bayer[(size_t)(2*row + g1r) * bw + (2*col + g1c)] +
+                    bayer[(size_t)(2*row + g2r)  * bw + (2*col + g2c)]) * 0.5f;
+            b[i] = bayer[(size_t)(2*row + br)   * bw + (2*col + bc)];
         }
 }
 
@@ -652,13 +673,14 @@ int main(int argc, char **argv)
     std::sort(inputs.begin(), inputs.end());
 
     const string refPat = readBayerPat(inputs[0]);
-    if (!refPat.empty() && refPat != "RGGB")
+    BayerLayout refLayout{};
+    const bool bayer = !refPat.empty();
+    if (bayer && !parseBayerLayout(refPat, refLayout))
     {
         cerr << "Unsupported Bayer pattern \"" << refPat << "\" in " << inputs[0]
-             << " -- only RGGB is supported.\n";
+             << " -- supported: RGGB GRBG GBRG BGGR.\n";
         return 1;
     }
-    const bool bayer = (refPat == "RGGB");
 
     // ------------------------------------------------------------------
     // Load reference; set DONUTS reference on green channel or full frame.
@@ -670,7 +692,7 @@ int main(int argc, char **argv)
 
     const char *modeNames[] = { "mean", "median", "sigmaclip", "wstream" };
     cout << "Reference: " << inputs[0] << "  (" << bw << "x" << bh << ")";
-    if (bayer) cout << "  [RGGB Bayer]";
+    if (bayer) cout << "  [" << refPat << " Bayer]";
     cout << "  mode=" << modeNames[(int)mode];
     if (mode == StackMode::SigmaClip || mode == StackMode::WelfordStream)
         cout << " kappa=" << kappa;
@@ -680,7 +702,7 @@ int main(int argc, char **argv)
     if (bayer)
     {
         int gw = 0, gh = 0;
-        auto refGreen = extractGreen(refRaw, bw, bh, gw, gh);
+        auto refGreen = extractGreen(refRaw, bw, bh, gw, gh, refLayout);
         auto refGreenD = toDouble(refGreen);
         guider.setReference(refGreenD.data(), gw, gh);
     }
@@ -717,7 +739,7 @@ int main(int argc, char **argv)
         if (bayer)
         {
             int gw=0, gh=0;
-            auto g  = extractGreen(raw, fw, fh, gw, gh);
+            auto g  = extractGreen(raw, fw, fh, gw, gh, refLayout);
             auto gd = toDouble(g);
             fi.t    = guider.measure(gd.data(), gw, gh);
         }
@@ -904,7 +926,7 @@ int main(int argc, char **argv)
 
     {
         vector<Pix> r, g, b;
-        if (bayer) { int tw=0,th=0; debayerRGGB(refRaw, bw, bh, r, g, b, tw, th); }
+        if (bayer) { int tw=0,th=0; debayer(refRaw, bw, bh, r, g, b, tw, th, refLayout); }
         else       { r = refRaw; g = refRaw; b = refRaw; }
         if (mode == StackMode::WelfordStream) welfordFrame(r, g, b, nullptr, true);
         else                                  accumulateFrame(r, g, b, nullptr);
@@ -923,7 +945,7 @@ int main(int argc, char **argv)
         if (raw.empty()) continue;
 
         vector<Pix> r, g, b;
-        if (bayer) { int tw=0,th=0; debayerRGGB(raw, fw, fh, r, g, b, tw, th); }
+        if (bayer) { int tw=0,th=0; debayer(raw, fw, fh, r, g, b, tw, th, refLayout); }
         else       { r = raw; g = raw; b = raw; }
 
         vector<Pix>     dstR(npix), dstG(npix), dstB(npix);
