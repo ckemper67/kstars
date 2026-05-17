@@ -784,8 +784,8 @@ int main(int argc, char **argv)
     // Welford online update for streaming sigma-clip.
     // bootstrap=true for the reference frame: always accept, no gate.
     // bootstrap=false for subsequent frames: gate with kappa*sigma before update.
-    // Gate rejects a pixel if ANY channel exceeds kappa*sigma -- avoids color
-    // contamination from satellite trails that hit only one channel (Bayer).
+    // Gate uses the G channel only: satellites are broadband so G is sufficient,
+    // and single-channel gating avoids false rejection of chromatic targets.
     // Requires n >= 2 to have a meaningful variance estimate; earlier samples
     // are always accepted to seed the statistics.
     auto welfordFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
@@ -800,18 +800,14 @@ int main(int argc, char **argv)
                 if (maskPtr && !(*maskPtr)[k]) continue;
                 uint32_t n = wCount[k];
 
-                // Rejection gate: skip pixel if any channel is an outlier.
-                if (!bootstrap && n >= 2)
+                // Rejection gate: use G channel only.
+                // Satellite/airplane trails are broadband -- G catches them just as
+                // well as per-channel. Single-channel gating avoids false rejection
+                // of chromatic targets (e.g. red stars with legitimately high R variance).
+                if (!bootstrap && n >= 2 && wM2G[k] > 0.0f)
                 {
-                    const float nf1 = (float)(n - 1);
-                    auto outlier = [&](float val, float mean, float m2) -> bool {
-                        if (m2 <= 0.0f) return false;
-                        float sig = std::sqrt(m2 / nf1);
-                        return std::abs(val - mean) > kf * sig;
-                    };
-                    if (outlier(r[k], wMeanR[k], wM2R[k]) ||
-                        outlier(g[k], wMeanG[k], wM2G[k]) ||
-                        outlier(b[k], wMeanB[k], wM2B[k]))
+                    float sig = std::sqrt(wM2G[k] / (float)(n - 1));
+                    if (std::abs(g[k] - wMeanG[k]) > kf * sig)
                         continue;
                 }
 
