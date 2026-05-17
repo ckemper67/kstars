@@ -21,6 +21,38 @@ namespace Donuts
 {
 
 // ---------------------------------------------------------------------------
+// Transform::alignmentMatrix
+// ---------------------------------------------------------------------------
+//
+// DONUTS convention: the measured (dx, dy, dtheta, scale) describe the
+// transform from reference to current frame as:
+//   "translate by (dx, dy), then rotate by dtheta about the image centre,
+//    then scale isotropically about the centre."
+//
+// The alignment matrix inverts this: for each output (reference-grid) pixel
+// at (xd, yd) it computes the corresponding source pixel in the current frame.
+// Expanding with cx=w/2, cy=h/2, co=cos(dtheta), si=sin(dtheta), s=scale:
+//
+//   xs = s*co*(xd + dx - cx) - s*si*(yd + dy - cy) + cx
+//   ys = s*si*(xd + dx - cx) + s*co*(yd + dy - cy) + cy
+//
+// which gives the 2x3 matrix below.
+
+AffineMatrix Transform::alignmentMatrix(int w, int h) const
+{
+    const double cx = w * 0.5, cy = h * 0.5;
+    const double co = std::cos(dtheta), si = std::sin(dtheta);
+    AffineMatrix m;
+    m.a  =  scale * co;
+    m.b  = -scale * si;
+    m.c  =  scale * si;
+    m.d  =  scale * co;
+    m.tx = m.a * (dx - cx) + m.b * (dy - cy) + cx;
+    m.ty = m.c * (dx - cx) + m.d * (dy - cy) + cy;
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 

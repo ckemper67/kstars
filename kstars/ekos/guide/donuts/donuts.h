@@ -28,6 +28,18 @@ struct Config
     bool   detectScale     = false;  // add isotropic scale as a 4th DoF (for focus tracking)
 };
 
+// 2x3 affine matrix in row-major order.
+// Applies as: [xs, ys]^T = M * [xd, yd, 1]^T
+//   xs = a*xd + b*yd + tx
+//   ys = c*xd + d*yd + ty
+struct AffineMatrix
+{
+    double a = 1, b = 0, tx = 0;
+    double c = 0, d = 1, ty = 0;
+
+    static AffineMatrix identity() { return {}; }
+};
+
 struct Transform
 {
     double dx     = 0;    // x translation in pixels (positive = right)
@@ -40,6 +52,12 @@ struct Transform
     double snr    = 0;    // minimum per-quadrant correlation SNR (< 3 = unreliable)
 
     bool valid() const { return snr >= 3.0; }
+
+    // Alignment affine matrix: maps a reference-frame pixel (xd, yd) to the
+    // corresponding source pixel (xs, ys) in the current frame, ready for
+    // inverse-warp resampling.  width/height are the image dimensions used
+    // for the rotation centre (pass half-resolution for Bayer frames).
+    AffineMatrix alignmentMatrix(int width, int height) const;
 };
 
 // 4-DoF guider using 4-quadrant 1-D phase-only correlation.

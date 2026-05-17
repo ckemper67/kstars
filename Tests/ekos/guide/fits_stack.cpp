@@ -323,33 +323,34 @@ static inline void cubicWeights4(float t, float w[4])
 }
 
 // Per-row x range where all 16 source pixels in the 4x4 kernel are in-bounds.
-// Source mapping: sx(x) = co*x + sx0,  sy(x) = -si*x + sy0  (linear in x).
+// Source mapping: sx(x) = dsx_dx*x + sx0,  sy(x) = dsy_dx*x + sy0  (linear in x).
+// These are just the first column of the affine matrix (m.a, m.c) and the
+// per-row offsets (m.b*y + m.tx, m.d*y + m.ty).
 // Safe condition: ix in [1, w-3] and iy in [1, h-3].
 // Returns [xlo, xhi] inclusive; xhi < xlo means the whole row needs clamping.
 static pair<int,int> interiorXRange(double sx0, double sy0,
-                                    double co, double si,
+                                    double dsx_dx, double dsy_dx,
                                     int w, int h)
 {
     double lo = 0.0, hi = (double)(w - 1);
 
-    // sx constraint: co*x + sx0 in [1, w-2)
-    if (std::abs(co) > 1e-12)
+    // sx constraint: dsx_dx*x + sx0 in [1, w-2)
+    if (std::abs(dsx_dx) > 1e-12)
     {
-        double a = (1.0   - sx0) / co;
-        double b = (w-2.0 - sx0) / co - 1e-9;   // strict upper bound
-        if (co > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
-        else        { lo = std::max(lo, b); hi = std::min(hi, a); }
+        double a = (1.0   - sx0) / dsx_dx;
+        double b = (w-2.0 - sx0) / dsx_dx - 1e-9;
+        if (dsx_dx > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
+        else            { lo = std::max(lo, b); hi = std::min(hi, a); }
     }
     else if (sx0 < 1.0 || sx0 >= w - 2.0) return {0, -1};
 
-    // sy constraint: -si*x + sy0 in [1, h-2)
-    const double dsy = -si;
-    if (std::abs(dsy) > 1e-12)
+    // sy constraint: dsy_dx*x + sy0 in [1, h-2)
+    if (std::abs(dsy_dx) > 1e-12)
     {
-        double a = (1.0   - sy0) / dsy;
-        double b = (h-2.0 - sy0) / dsy - 1e-9;
-        if (dsy > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
-        else         { lo = std::max(lo, b); hi = std::min(hi, a); }
+        double a = (1.0   - sy0) / dsy_dx;
+        double b = (h-2.0 - sy0) / dsy_dx - 1e-9;
+        if (dsy_dx > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
+        else            { lo = std::max(lo, b); hi = std::min(hi, a); }
     }
     else if (sy0 < 1.0 || sy0 >= h - 2.0) return {0, -1};
 
@@ -359,34 +360,31 @@ static pair<int,int> interiorXRange(double sx0, double sy0,
 }
 
 // ---------------------------------------------------------------------------
-// Fused 3-channel bicubic rigid-body warp.
+// Fused 3-channel bicubic warp using a precomputed AffineMatrix.
 // Processes dst rows [ylo, yhi) for parallel dispatch.
-// Pass (-t.dx, -t.dy, -t.dtheta) to undo a measured DONUTS transform.
+// Pass t.alignmentMatrix(w, h) to undo a measured DONUTS transform.
 // ---------------------------------------------------------------------------
 
 static void alignFrame3rows(
     const vector<Pix> &srcR, const vector<Pix> &srcG, const vector<Pix> &srcB,
     int w, int h,
-    double dx, double dy, double dtheta,
+    const Donuts::AffineMatrix &m,
     vector<Pix> &dstR, vector<Pix> &dstG, vector<Pix> &dstB,
     vector<uint8_t> &mask,
     int ylo, int yhi)
 {
-    const double co = cos(dtheta), si = sin(dtheta);
-    const double mx = w * 0.5,     my = h * 0.5;
-
     for (int y = ylo; y < yhi; ++y)
     {
-        const double y1   = y - dy - my;
-        const double sx0  = co*(-dx - mx) + y1*si + mx;   // sx at x=0
-        const double sy0  =  si*(dx + mx) + y1*co + my;   // sy at x=0
+        // Per-row offsets: sx(x) = m.a*x + sx0,  sy(x) = m.c*x + sy0
+        const double sx0 = m.b * y + m.tx;
+        const double sy0 = m.d * y + m.ty;
 
-        auto [xInLo, xInHi] = interiorXRange(sx0, sy0, co, si, w, h);
+        auto [xInLo, xInHi] = interiorXRange(sx0, sy0, m.a, m.c, w, h);
 
         for (int x = 0; x < w; ++x)
         {
-            const double sx = sx0 + co * x;
-            const double sy = sy0 - si * x;
+            const double sx = m.a * x + sx0;
+            const double sy = m.c * x + sy0;
             const size_t k  = (size_t)y * w + x;
 
             if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h)
@@ -780,10 +778,10 @@ int main(int argc, char **argv)
         vector<Pix>     dstR(npix), dstG(npix), dstB(npix);
         vector<uint8_t> mask(npix, 0);
 
+        const auto M = fi.t.alignmentMatrix(dw, dh);
         parallelFor(dh, nThreads, [&](int ylo, int yhi)
         {
-            alignFrame3rows(r, g, b, dw, dh,
-                            -fi.t.dx, -fi.t.dy, -fi.t.dtheta,
+            alignFrame3rows(r, g, b, dw, dh, M,
                             dstR, dstG, dstB, mask, ylo, yhi);
         });
 
