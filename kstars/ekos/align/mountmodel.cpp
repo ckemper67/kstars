@@ -548,9 +548,9 @@ void MountModel::slotWizardAlignmentPoints()
     }
 
     if (alignTypeBox->currentIndex() == OBJECT_HALTON_SEQUENCE ||
-        alignTypeBox->currentIndex() == OBJECT_NAMED_STAR ||
-        alignTypeBox->currentIndex() == OBJECT_ANY_STAR ||
-        alignTypeBox->currentIndex() == OBJECT_ANY_OBJECT)
+            alignTypeBox->currentIndex() == OBJECT_NAMED_STAR ||
+            alignTypeBox->currentIndex() == OBJECT_ANY_STAR ||
+            alignTypeBox->currentIndex() == OBJECT_ANY_OBJECT)
     {
         // Generate points directly in AltAz space so every point is above the
         // horizon by construction.  85 deg ceiling avoids the azimuth singularity
@@ -564,7 +564,10 @@ void MountModel::slotWizardAlignmentPoints()
 
         const bool snap = alignTypeBox->currentIndex() != OBJECT_HALTON_SEQUENCE;
         QSet<const SkyObject *> usedObjects;
-        struct Point { QString ra, dec, name; };
+        struct Point
+        {
+            QString ra, dec, name;
+        };
         QVector<Point> newPoints;
 
         // Iterate through the Halton sequence until we have enough points.

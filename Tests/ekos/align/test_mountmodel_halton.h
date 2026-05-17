@@ -16,21 +16,21 @@
 
 class TestMountModelHalton : public QObject
 {
-    Q_OBJECT
+        Q_OBJECT
 
-public:
-    TestMountModelHalton();
-    ~TestMountModelHalton() override = default;
+    public:
+        TestMountModelHalton();
+        ~TestMountModelHalton() override = default;
 
-private Q_SLOTS:
-    void testPointsAboveHorizon_data();
-    void testPointsAboveHorizon();
+    private Q_SLOTS:
+        void testPointsAboveHorizon_data();
+        void testPointsAboveHorizon();
 
-    void testPointsAwayFromPole_data();
-    void testPointsAwayFromPole();
+        void testPointsAwayFromPole_data();
+        void testPointsAwayFromPole();
 
-private:
-    static double halton(int index, int base);
+    private:
+        static double halton(int index, int base);
 };
 
 #endif
