@@ -28,6 +28,9 @@
  *   - Per-thread scratch buffer eliminates per-pixel malloc in median/sigmaclip
  *   - Per-pixel median+MAD sigma-clip (robust to satellites/airplane trails)
  *   - uint8_t mask (no bit-pack overhead of vector<bool>)
+ *   - Welford streaming mode (-m wstream): O(pixels) memory regardless of
+ *     frame count; per-pixel online rejection gate (kappa*sigma) using
+ *     Welford's numerically stable recurrence. Ideal for long EAA sessions.
  *
  * Build (from repo root):
  *   c++ -std=c++17 -O2 -march=native \
@@ -41,7 +44,7 @@
  *
  * Usage:
  *   ./fits_stack [-o output.fits] [-p output.png]
- *               [-m mean|median|sigmaclip] [-k kappa] [-j threads]
+ *               [-m mean|median|sigmaclip|wstream] [-k kappa] [-j threads]
  *               frame1.fits frame2.fits ...
  *
  *   Inputs are sorted alphabetically; the first is the reference.
@@ -83,7 +86,7 @@ constexpr double MAD_NSIGMA         = 3.0;
 // Stacking mode
 // ---------------------------------------------------------------------------
 
-enum class StackMode { Mean, Median, SigmaClip };
+enum class StackMode { Mean, Median, SigmaClip, WelfordStream };
 
 // ---------------------------------------------------------------------------
 // Thread pool: partition [0, n) into nThreads contiguous blocks.
@@ -611,6 +614,7 @@ int main(int argc, char **argv)
             string m = argv[++i];
             if      (m == "median")    mode = StackMode::Median;
             else if (m == "sigmaclip") mode = StackMode::SigmaClip;
+            else if (m == "wstream")   mode = StackMode::WelfordStream;
             else if (m != "mean") { cerr << "Unknown mode: " << m << "\n"; return 1; }
         }
         else inputs.push_back(a);
@@ -628,11 +632,12 @@ int main(int argc, char **argv)
     vector<Pix> refRaw = loadFITS(inputs[0], bw, bh);
     if (refRaw.empty()) return 1;
 
-    const char *modeNames[] = { "mean", "median", "sigmaclip" };
+    const char *modeNames[] = { "mean", "median", "sigmaclip", "wstream" };
     cout << "Reference: " << inputs[0] << "  (" << bw << "x" << bh << ")";
     if (bayer) cout << "  [RGGB Bayer]";
     cout << "  mode=" << modeNames[(int)mode];
-    if (mode == StackMode::SigmaClip) cout << " kappa=" << kappa;
+    if (mode == StackMode::SigmaClip || mode == StackMode::WelfordStream)
+        cout << " kappa=" << kappa;
     cout << "  threads=" << nThreads << "\n";
 
     Donuts::Guider guider;
@@ -727,7 +732,7 @@ int main(int argc, char **argv)
 
     vector<Pix> stkR, stkG, stkB;
     vector<int> scount;
-    if (mode != StackMode::Mean)
+    if (mode == StackMode::Median || mode == StackMode::SigmaClip)
     {
         stkR.assign(npix * depth, 0.0f);
         stkG.assign(npix * depth, 0.0f);
@@ -735,6 +740,20 @@ int main(int argc, char **argv)
         scount.assign(npix, 0);
         size_t mb = 3 * npix * depth * sizeof(Pix) / (1024*1024);
         cout << "Allocated " << mb << " MB for pixel stacks.\n";
+    }
+
+    // Welford streaming state: {mean, M2, count} per pixel -- O(pixels) memory
+    // regardless of frame count. mean[] is the live stacked image at all times.
+    vector<Pix>      wMeanR, wMeanG, wMeanB;
+    vector<Pix>      wM2R,   wM2G,   wM2B;
+    vector<uint32_t> wCount;
+    if (mode == StackMode::WelfordStream)
+    {
+        wMeanR.assign(npix, 0.0f); wMeanG.assign(npix, 0.0f); wMeanB.assign(npix, 0.0f);
+        wM2R.assign(npix, 0.0f);   wM2G.assign(npix, 0.0f);   wM2B.assign(npix, 0.0f);
+        wCount.assign(npix, 0u);
+        size_t mb = (6 * sizeof(Pix) + sizeof(uint32_t)) * npix / (1024*1024);
+        cout << "Welford streaming: " << mb << " MB (constant, frame-count-independent).\n";
     }
 
     // Threaded accumulate: pixel ranges are disjoint across threads -- no locking.
@@ -762,6 +781,52 @@ int main(int argc, char **argv)
         });
     };
 
+    // Welford online update for streaming sigma-clip.
+    // bootstrap=true for the reference frame: always accept, no gate.
+    // bootstrap=false for subsequent frames: gate with kappa*sigma before update.
+    // Gate rejects a pixel if ANY channel exceeds kappa*sigma -- avoids color
+    // contamination from satellite trails that hit only one channel (Bayer).
+    // Requires n >= 2 to have a meaningful variance estimate; earlier samples
+    // are always accepted to seed the statistics.
+    auto welfordFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
+                            const vector<Pix> &b, const vector<uint8_t> *maskPtr,
+                            bool bootstrap)
+    {
+        const float kf = (float)kappa;
+        parallelFor((int)npix, nThreads, [&](int klo, int khi)
+        {
+            for (int k = klo; k < khi; ++k)
+            {
+                if (maskPtr && !(*maskPtr)[k]) continue;
+                uint32_t n = wCount[k];
+
+                // Rejection gate: skip pixel if any channel is an outlier.
+                if (!bootstrap && n >= 2)
+                {
+                    const float nf1 = (float)(n - 1);
+                    auto outlier = [&](float val, float mean, float m2) -> bool {
+                        if (m2 <= 0.0f) return false;
+                        float sig = std::sqrt(m2 / nf1);
+                        return std::abs(val - mean) > kf * sig;
+                    };
+                    if (outlier(r[k], wMeanR[k], wM2R[k]) ||
+                        outlier(g[k], wMeanG[k], wM2G[k]) ||
+                        outlier(b[k], wMeanB[k], wM2B[k]))
+                        continue;
+                }
+
+                // Welford recurrence (numerically stable online mean + M2).
+                ++n;
+                const float nf = (float)n;
+                float d;
+                d = r[k] - wMeanR[k]; wMeanR[k] += d / nf; wM2R[k] += d * (r[k] - wMeanR[k]);
+                d = g[k] - wMeanG[k]; wMeanG[k] += d / nf; wM2G[k] += d * (g[k] - wMeanG[k]);
+                d = b[k] - wMeanB[k]; wMeanB[k] += d / nf; wM2B[k] += d * (b[k] - wMeanB[k]);
+                wCount[k] = n;
+            }
+        });
+    };
+
     // ------------------------------------------------------------------
     // Add reference frame (no transform; all pixels valid).
     // ------------------------------------------------------------------
@@ -770,7 +835,8 @@ int main(int argc, char **argv)
         vector<Pix> r, g, b;
         if (bayer) { int tw=0,th=0; debayerRGGB(refRaw, bw, bh, r, g, b, tw, th); }
         else       { r = refRaw; g = refRaw; b = refRaw; }
-        accumulateFrame(r, g, b, nullptr);
+        if (mode == StackMode::WelfordStream) welfordFrame(r, g, b, nullptr, true);
+        else                                  accumulateFrame(r, g, b, nullptr);
     }
 
     // ------------------------------------------------------------------
@@ -799,7 +865,8 @@ int main(int argc, char **argv)
                             dstR, dstG, dstB, mask, ylo, yhi);
         });
 
-        accumulateFrame(dstR, dstG, dstB, &mask);
+        if (mode == StackMode::WelfordStream) welfordFrame(dstR, dstG, dstB, &mask, false);
+        else                                  accumulateFrame(dstR, dstG, dstB, &mask);
         ++stackCount;
     }
 
@@ -812,7 +879,12 @@ int main(int argc, char **argv)
 
     vector<Pix> finalR(npix), finalG(npix), finalB(npix);
 
-    if (mode == StackMode::Mean)
+    if (mode == StackMode::WelfordStream)
+    {
+        // mean[] is already the final stacked image -- no separate reduce pass needed.
+        finalR = wMeanR; finalG = wMeanG; finalB = wMeanB;
+    }
+    else if (mode == StackMode::Mean)
     {
         parallelFor((int)npix, nThreads, [&](int klo, int khi)
         {
