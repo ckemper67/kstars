@@ -5,28 +5,32 @@
  *
  * Standalone FITS stacker using the DONUTS rotation/translation solver.
  *
- * Monochrome: aligns and mean-combines directly.
- * Bayer (BAYERPAT header): extracts the green channel at half resolution for
- * DONUTS registration, then does a 2x2 RGGB debayer and applies the full
- * rigid-body transform (dx, dy, dtheta) to each color channel before stacking.
- * Output for Bayer input is a 3-plane FITS (R/G/B) at half the input resolution.
- * Only RGGB with XBAYROFF=0 YBAYROFF=0 is supported.
+ * Monochrome: aligns and stacks directly.
+ * Bayer (BAYERPAT=RGGB): extracts green at half resolution for DONUTS
+ * registration, then 2x2 debayers and applies the rigid-body transform to
+ * each colour channel before stacking. Output is a 3-plane FITS (R/G/B) at
+ * half resolution.
  *
- * Alignment uses Catmull-Rom bicubic interpolation with clamped boundaries.
+ * Alignment: Catmull-Rom bicubic with clamped boundaries.
  *
  * Frame rejection (two-pass):
  *   1. Hard bounds: |dtheta| <= 5 deg, |dx|/|dy| <= 150 half-res px.
  *   2. MAD sigma-clip (3-sigma) on dx, dy, dtheta of hard-bound survivors.
  *
- * Accumulation uses a per-pixel coverage count (mean mode) or per-pixel
- * value store (median and sigmaclip modes) so zero-padded border regions
- * from shifted frames don't dilute edge pixel values.
+ * Per-pixel coverage count so zero-padded border regions don't dilute edges.
  *
- * PNG stretch: per-channel median subtraction, then linked luminance-based
- * asinh stretch (same tone curve applied to all three channels).
+ * Performance optimizations vs v1:
+ *   - float pixel buffers (halves memory, enables 4-wide ARM NEON SIMD)
+ *   - 3-channel fused bicubic warp: coordinate math amortized over R/G/B
+ *   - ARM NEON fast path for interior pixels (no per-lane bounds clamping)
+ *   - Per-row interior x-range precomputed analytically to split fast/slow paths
+ *   - Thread-parallel warp, accumulate, and reduce via std::thread (-j N)
+ *   - Per-thread scratch buffer eliminates per-pixel malloc in median/sigmaclip
+ *   - In-place sigma-clip compaction with running stats (no vector<bool>)
+ *   - uint8_t mask (no bit-pack overhead of vector<bool>)
  *
  * Build (from repo root):
- *   c++ -std=c++17 -O2 \
+ *   c++ -std=c++17 -O2 -march=native \
  *       -I kstars/ekos/guide/donuts \
  *       -I /opt/homebrew/include \
  *       Tests/ekos/guide/fits_stack.cpp \
@@ -37,12 +41,12 @@
  *
  * Usage:
  *   ./fits_stack [-o output.fits] [-p output.png]
- *               [-m mean|median|sigmaclip] [-k kappa]
+ *               [-m mean|median|sigmaclip] [-k kappa] [-j threads]
  *               frame1.fits frame2.fits ...
  *
- *   Inputs are sorted alphabetically. The first file (after sorting) is the
- *   reference frame.  Default output: stacked.fits.  Default mode: mean.
- *   -k sets the sigma-clip rejection threshold (default 3.0).
+ *   Inputs are sorted alphabetically; the first is the reference.
+ *   Default output: stacked.fits.  Default mode: mean.
+ *   -j 0 (or omitted) uses std::thread::hardware_concurrency().
  */
 
 #include "donuts.h"
@@ -51,13 +55,21 @@
 #include <cassert>
 #include <cmath>
 #include <fitsio.h>
+#include <functional>
 #include <iostream>
 #include <numeric>
 #include <png.h>
 #include <string>
+#include <thread>
 #include <vector>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 using namespace std;
+
+using Pix = float;
 
 // ---------------------------------------------------------------------------
 // Rejection thresholds
@@ -74,10 +86,33 @@ constexpr double MAD_NSIGMA         = 3.0;
 enum class StackMode { Mean, Median, SigmaClip };
 
 // ---------------------------------------------------------------------------
+// Thread pool: partition [0, n) into nThreads contiguous blocks.
+// ---------------------------------------------------------------------------
+
+static void parallelFor(int n, int nThreads, function<void(int, int)> fn)
+{
+    if (nThreads <= 1 || n <= nThreads)
+    {
+        fn(0, n);
+        return;
+    }
+    vector<thread> threads;
+    threads.reserve(nThreads);
+    int chunk = (n + nThreads - 1) / nThreads;
+    for (int t = 0; t < nThreads; ++t)
+    {
+        int lo = t * chunk, hi = min(lo + chunk, n);
+        if (lo >= n) break;
+        threads.emplace_back(fn, lo, hi);
+    }
+    for (auto &t : threads) t.join();
+}
+
+// ---------------------------------------------------------------------------
 // FITS I/O
 // ---------------------------------------------------------------------------
 
-static vector<double> loadFITS(const string &path, int &w, int &h)
+static vector<Pix> loadFITS(const string &path, int &w, int &h)
 {
     fitsfile *fptr = nullptr;
     int s = 0;
@@ -90,10 +125,13 @@ static vector<double> loadFITS(const string &path, int &w, int &h)
     fits_get_img_size(fptr, 2, naxes, &s);
     w = (int)naxes[0];
     h = (int)naxes[1];
-    vector<double> buf((size_t)w * h);
-    fits_read_img(fptr, TDOUBLE, 1, (long)w * h, nullptr, buf.data(), nullptr, &s);
+    // Read as double for correct BZERO/BSCALE handling, then narrow to float.
+    vector<double> tmp((size_t)w * h);
+    fits_read_img(fptr, TDOUBLE, 1, (long)w * h, nullptr, tmp.data(), nullptr, &s);
     fits_close_file(fptr, &s);
     if (s) { cerr << "Read error on " << path << " (status " << s << ")\n"; return {}; }
+    vector<Pix> buf(tmp.size());
+    for (size_t i = 0; i < tmp.size(); ++i) buf[i] = (Pix)tmp[i];
     return buf;
 }
 
@@ -112,33 +150,33 @@ static bool isBayerRGGB(const string &path)
     return pat == "RGGB";
 }
 
-static bool writeFITS(const string &path, const vector<double> &pixels, int w, int h)
+static bool writeFITS(const string &path, const vector<Pix> &pixels, int w, int h)
 {
     fitsfile *fptr = nullptr;
     int s = 0;
     fits_create_file(&fptr, ("!" + path).c_str(), &s);
     long naxes[2] = { (long)w, (long)h };
-    fits_create_img(fptr, DOUBLE_IMG, 2, naxes, &s);
-    fits_write_img(fptr, TDOUBLE, 1, (long)w * h,
-                   const_cast<double *>(pixels.data()), &s);
+    fits_create_img(fptr, FLOAT_IMG, 2, naxes, &s);
+    fits_write_img(fptr, TFLOAT, 1, (long)w * h,
+                   const_cast<Pix *>(pixels.data()), &s);
     fits_close_file(fptr, &s);
     if (s) { cerr << "Write error on " << path << " (status " << s << ")\n"; return false; }
     return true;
 }
 
 static bool writeFITS3(const string &path,
-                       const vector<double> &r, const vector<double> &g, const vector<double> &b,
+                       const vector<Pix> &r, const vector<Pix> &g, const vector<Pix> &b,
                        int w, int h)
 {
     fitsfile *fptr = nullptr;
     int s = 0;
     fits_create_file(&fptr, ("!" + path).c_str(), &s);
     long naxes[3] = { (long)w, (long)h, 3 };
-    fits_create_img(fptr, DOUBLE_IMG, 3, naxes, &s);
+    fits_create_img(fptr, FLOAT_IMG, 3, naxes, &s);
     long npix = (long)w * h;
-    fits_write_img(fptr, TDOUBLE,           1, npix, const_cast<double *>(r.data()), &s);
-    fits_write_img(fptr, TDOUBLE,   npix + 1, npix, const_cast<double *>(g.data()), &s);
-    fits_write_img(fptr, TDOUBLE, 2*npix + 1, npix, const_cast<double *>(b.data()), &s);
+    fits_write_img(fptr, TFLOAT,           1, npix, const_cast<Pix *>(r.data()), &s);
+    fits_write_img(fptr, TFLOAT,   npix + 1, npix, const_cast<Pix *>(g.data()), &s);
+    fits_write_img(fptr, TFLOAT, 2*npix + 1, npix, const_cast<Pix *>(b.data()), &s);
     fits_close_file(fptr, &s);
     if (s) { cerr << "Write error on " << path << " (status " << s << ")\n"; return false; }
     return true;
@@ -148,41 +186,42 @@ static bool writeFITS3(const string &path,
 // PNG output: median background subtraction + linked luminance asinh stretch
 // ---------------------------------------------------------------------------
 
-static vector<double> subtractMedian(vector<double> ch)
+static vector<Pix> subtractMedian(vector<Pix> ch)
 {
-    vector<double> s(ch);
+    vector<Pix> s(ch);
     std::sort(s.begin(), s.end());
-    double med = s[s.size() / 2];
-    for (double &v : ch) v -= med;
+    Pix med = s[s.size() / 2];
+    for (Pix &v : ch) v -= med;
     return ch;
 }
 
-static vector<uint8_t> asinhStretch(const vector<double> &ch, double lo, double hi)
+static vector<uint8_t> asinhStretch(const vector<Pix> &ch, double lo, double hi)
 {
-    const double softening = 0.05 * (hi - lo);
-    const double norm      = std::asinh((hi - lo) / softening);
+    double softening = 0.05 * (hi - lo);
+    if (softening < 1.0) softening = 1.0;
+    double norm = std::asinh((hi - lo) / softening);
     vector<uint8_t> out(ch.size());
     for (size_t i = 0; i < ch.size(); ++i)
     {
-        double v = std::asinh((ch[i] - lo) / softening) / norm * 255.0;
+        double v = std::asinh(((double)ch[i] - lo) / softening) / norm * 255.0;
         out[i] = (uint8_t)std::max(0.0, std::min(255.0, v));
     }
     return out;
 }
 
 static bool writePNG(const string &path,
-                     const vector<double> &r, const vector<double> &g, const vector<double> &b,
+                     const vector<Pix> &r, const vector<Pix> &g, const vector<Pix> &b,
                      int w, int h)
 {
     auto rn = subtractMedian(r);
     auto gn = subtractMedian(g);
     auto bn = subtractMedian(b);
 
-    vector<double> lum(rn.size());
+    vector<Pix> lum(rn.size());
     for (size_t i = 0; i < lum.size(); ++i)
-        lum[i] = 0.299 * rn[i] + 0.587 * gn[i] + 0.114 * bn[i];
+        lum[i] = 0.299f * rn[i] + 0.587f * gn[i] + 0.114f * bn[i];
 
-    vector<double> slum(lum);
+    vector<Pix> slum(lum);
     std::sort(slum.begin(), slum.end());
     double lo = slum[(size_t)(0.005 * (slum.size() - 1))];
     double hi = slum[(size_t)(0.995 * (slum.size() - 1))];
@@ -222,27 +261,35 @@ static bool writePNG(const string &path,
     return true;
 }
 
+// Donuts::Guider takes const double*; convert float buffer for registration.
+static vector<double> toDouble(const vector<Pix> &v)
+{
+    vector<double> d(v.size());
+    for (size_t i = 0; i < v.size(); ++i) d[i] = v[i];
+    return d;
+}
+
 // ---------------------------------------------------------------------------
 // Bayer helpers (RGGB, XBAYROFF=0 YBAYROFF=0)
 // ---------------------------------------------------------------------------
 
-static vector<double> extractGreen(const vector<double> &bayer, int bw, int bh, int &gw, int &gh)
+static vector<Pix> extractGreen(const vector<Pix> &bayer, int bw, int bh, int &gw, int &gh)
 {
     gw = bw / 2;
     gh = bh / 2;
-    vector<double> green((size_t)gw * gh);
+    vector<Pix> green((size_t)gw * gh);
     for (int r = 0; r < gh; ++r)
         for (int c = 0; c < gw; ++c)
         {
-            double g1 = bayer[(size_t)(2*r)     * bw + (2*c + 1)];
-            double g2 = bayer[(size_t)(2*r + 1)  * bw + (2*c)];
-            green[(size_t)r * gw + c] = (g1 + g2) * 0.5;
+            Pix g1 = bayer[(size_t)(2*r)     * bw + (2*c + 1)];
+            Pix g2 = bayer[(size_t)(2*r + 1)  * bw + (2*c)];
+            green[(size_t)r * gw + c] = (g1 + g2) * 0.5f;
         }
     return green;
 }
 
-static void debayerRGGB(const vector<double> &bayer, int bw, int bh,
-                        vector<double> &r, vector<double> &g, vector<double> &b,
+static void debayerRGGB(const vector<Pix> &bayer, int bw, int bh,
+                        vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
                         int &w, int &h)
 {
     w = bw / 2;
@@ -255,121 +302,247 @@ static void debayerRGGB(const vector<double> &bayer, int bw, int bh,
             size_t i = (size_t)row * w + col;
             r[i] = bayer[(size_t)(2*row)     * bw + (2*col)];
             g[i] = (bayer[(size_t)(2*row)     * bw + (2*col + 1)] +
-                    bayer[(size_t)(2*row + 1)  * bw + (2*col)]) * 0.5;
+                    bayer[(size_t)(2*row + 1)  * bw + (2*col)]) * 0.5f;
             b[i] = bayer[(size_t)(2*row + 1)  * bw + (2*col + 1)];
         }
 }
 
 // ---------------------------------------------------------------------------
-// Bicubic (Catmull-Rom) rigid-body alignment, clamped boundaries.
-// mask (if provided) is set true for pixels with a source sample in-frame.
-// dtheta in radians; to undo a measured transform pass (-dx, -dy, -dtheta).
+// Bicubic helpers
 // ---------------------------------------------------------------------------
 
-static double cubicWeight(double x)
+// Catmull-Rom weights for fractional position t in [0,1).
+// w[0]=weight for ix-1, w[1]=ix+0, w[2]=ix+1, w[3]=ix+2.
+static inline void cubicWeights4(float t, float w[4])
 {
-    x = std::abs(x);
-    if (x < 1.0) return  1.5*x*x*x - 2.5*x*x + 1.0;
-    if (x < 2.0) return -0.5*x*x*x + 2.5*x*x - 4.0*x + 2.0;
-    return 0.0;
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f*t3 + t2 - 0.5f*t;
+    w[1] =  1.5f*t3 - 2.5f*t2 + 1.0f;
+    w[2] = -1.5f*t3 + 2.0f*t2 + 0.5f*t;
+    w[3] =  0.5f*t3 - 0.5f*t2;
 }
 
-static vector<double> alignFrame(
-    const vector<double> &src, int w, int h,
-    double dx, double dy, double dtheta,
-    vector<bool> *mask = nullptr)
+// Per-row x range where all 16 source pixels in the 4x4 kernel are in-bounds.
+// Source mapping: sx(x) = co*x + sx0,  sy(x) = -si*x + sy0  (linear in x).
+// Safe condition: ix in [1, w-3] and iy in [1, h-3].
+// Returns [xlo, xhi] inclusive; xhi < xlo means the whole row needs clamping.
+static pair<int,int> interiorXRange(double sx0, double sy0,
+                                    double co, double si,
+                                    int w, int h)
 {
-    if (mask) mask->assign((size_t)w * h, false);
-    vector<double> dst((size_t)w * h, 0.0);
-    const double co = cos(dtheta), si = sin(dtheta);
-    const double mx = w / 2.0, my = h / 2.0;
+    double lo = 0.0, hi = (double)(w - 1);
 
-    for (int y = 0; y < h; ++y)
+    // sx constraint: co*x + sx0 in [1, w-2)
+    if (std::abs(co) > 1e-12)
+    {
+        double a = (1.0   - sx0) / co;
+        double b = (w-2.0 - sx0) / co - 1e-9;   // strict upper bound
+        if (co > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
+        else        { lo = std::max(lo, b); hi = std::min(hi, a); }
+    }
+    else if (sx0 < 1.0 || sx0 >= w - 2.0) return {0, -1};
+
+    // sy constraint: -si*x + sy0 in [1, h-2)
+    const double dsy = -si;
+    if (std::abs(dsy) > 1e-12)
+    {
+        double a = (1.0   - sy0) / dsy;
+        double b = (h-2.0 - sy0) / dsy - 1e-9;
+        if (dsy > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
+        else         { lo = std::max(lo, b); hi = std::min(hi, a); }
+    }
+    else if (sy0 < 1.0 || sy0 >= h - 2.0) return {0, -1};
+
+    int ilo = std::max(0,   (int)std::ceil(lo));
+    int ihi = std::min(w-1, (int)hi);
+    return (ilo <= ihi) ? make_pair(ilo, ihi) : make_pair(0, -1);
+}
+
+// ---------------------------------------------------------------------------
+// Fused 3-channel bicubic rigid-body warp.
+// Processes dst rows [ylo, yhi) for parallel dispatch.
+// Pass (-t.dx, -t.dy, -t.dtheta) to undo a measured DONUTS transform.
+// ---------------------------------------------------------------------------
+
+static void alignFrame3rows(
+    const vector<Pix> &srcR, const vector<Pix> &srcG, const vector<Pix> &srcB,
+    int w, int h,
+    double dx, double dy, double dtheta,
+    vector<Pix> &dstR, vector<Pix> &dstG, vector<Pix> &dstB,
+    vector<uint8_t> &mask,
+    int ylo, int yhi)
+{
+    const double co = cos(dtheta), si = sin(dtheta);
+    const double mx = w * 0.5,     my = h * 0.5;
+
+    for (int y = ylo; y < yhi; ++y)
+    {
+        const double y1   = y - dy - my;
+        const double sx0  = co*(-dx - mx) + y1*si + mx;   // sx at x=0
+        const double sy0  =  si*(dx + mx) + y1*co + my;   // sy at x=0
+
+        auto [xInLo, xInHi] = interiorXRange(sx0, sy0, co, si, w, h);
+
         for (int x = 0; x < w; ++x)
         {
-            double x1 = x - dx - mx, y1 = y - dy - my;
-            double sx  =  x1 * co + y1 * si + mx;
-            double sy  = -x1 * si + y1 * co + my;
+            const double sx = sx0 + co * x;
+            const double sy = sy0 - si * x;
+            const size_t k  = (size_t)y * w + x;
 
-            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) continue;
-
-            int    ix = (int)sx, iy = (int)sy;
-            double fx = sx - ix,  fy = sy - iy;
-            double val = 0.0;
-
-            for (int dr = -1; dr <= 2; ++dr)
+            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h)
             {
-                double wy = cubicWeight(fy - dr);
-                int py = std::max(0, std::min(h - 1, iy + dr));
-                for (int dc = -1; dc <= 2; ++dc)
-                {
-                    double wx = cubicWeight(fx - dc);
-                    int px = std::max(0, std::min(w - 1, ix + dc));
-                    val += wx * wy * src[(size_t)py * w + px];
-                }
+                mask[k] = 0;
+                continue;
             }
 
-            dst[(size_t)y * w + x] = val;
-            if (mask) (*mask)[(size_t)y * w + x] = true;
+            const int   ix = (int)sx, iy = (int)sy;
+            const float fx = (float)(sx - ix), fy = (float)(sy - iy);
+            float wx[4], wy[4];
+            cubicWeights4(fx, wx);
+            cubicWeights4(fy, wy);
+
+            mask[k] = 1;
+
+            if (x >= xInLo && x <= xInHi)
+            {
+                // Fast path: all 16 neighbors in-bounds, no clamping needed.
+#ifdef __ARM_NEON
+                const float32x4_t wxv = vld1q_f32(wx);
+                float accR = 0.0f, accG = 0.0f, accB = 0.0f;
+                for (int dr = 0; dr < 4; ++dr)
+                {
+                    const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                    const float  wyd  = wy[dr];
+                    accR += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcR.data() + base), wxv));
+                    accG += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcG.data() + base), wxv));
+                    accB += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcB.data() + base), wxv));
+                }
+                dstR[k] = accR;
+                dstG[k] = accG;
+                dstB[k] = accB;
+#else
+                float vR = 0.0f, vG = 0.0f, vB = 0.0f;
+                for (int dr = 0; dr < 4; ++dr)
+                {
+                    const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                    const float  wyd  = wy[dr];
+                    for (int dc = 0; dc < 4; ++dc)
+                    {
+                        const float  wdc = wx[dc] * wyd;
+                        const size_t s   = base + dc;
+                        vR += wdc * srcR[s];
+                        vG += wdc * srcG[s];
+                        vB += wdc * srcB[s];
+                    }
+                }
+                dstR[k] = vR;
+                dstG[k] = vG;
+                dstB[k] = vB;
+#endif
+            }
+            else
+            {
+                // Slow path: clamp each of the 16 source coordinates.
+                float vR = 0.0f, vG = 0.0f, vB = 0.0f;
+                for (int dr = -1; dr <= 2; ++dr)
+                {
+                    const int   py  = std::max(0, std::min(h - 1, iy + dr));
+                    const float wyd = wy[dr + 1];
+                    for (int dc = -1; dc <= 2; ++dc)
+                    {
+                        const int   px  = std::max(0, std::min(w - 1, ix + dc));
+                        const float wdc = wx[dc + 1] * wyd;
+                        const size_t s  = (size_t)py * w + px;
+                        vR += wdc * srcR[s];
+                        vG += wdc * srcG[s];
+                        vB += wdc * srcB[s];
+                    }
+                }
+                dstR[k] = vR;
+                dstG[k] = vG;
+                dstB[k] = vB;
+            }
         }
-    return dst;
-}
-
-// ---------------------------------------------------------------------------
-// Per-pixel combine helpers
-// ---------------------------------------------------------------------------
-
-static double pixelMedian(double *vals, int n)
-{
-    vector<double> tmp(vals, vals + n);
-    std::sort(tmp.begin(), tmp.end());
-    return tmp[n / 2];
-}
-
-static double pixelSigmaClip(double *vals, int n, double kappa)
-{
-    vector<bool> keep(n, true);
-    for (int iter = 0; iter < 5; ++iter)
-    {
-        double sum = 0.0; int cnt = 0;
-        for (int i = 0; i < n; ++i) if (keep[i]) { sum += vals[i]; ++cnt; }
-        if (cnt == 0) break;
-        double mean = sum / cnt;
-        double var  = 0.0;
-        for (int i = 0; i < n; ++i) if (keep[i]) var += (vals[i] - mean) * (vals[i] - mean);
-        double sigma = std::sqrt(var / cnt);
-        bool changed = false;
-        for (int i = 0; i < n; ++i)
-            if (keep[i] && std::abs(vals[i] - mean) > kappa * sigma)
-                { keep[i] = false; changed = true; }
-        if (!changed) break;
     }
-    double sum = 0.0; int cnt = 0;
-    for (int i = 0; i < n; ++i) if (keep[i]) { sum += vals[i]; ++cnt; }
-    return cnt > 0 ? sum / cnt : vals[0];
-}
-
-// Reduce per-pixel stacks to final image according to mode.
-// stk layout: stk[pixelIndex * depth + frameIndex], count[pixelIndex] = valid frames.
-static vector<double> reduceStack(const vector<double> &stk, const vector<int> &count,
-                                  int depth, StackMode mode, double kappa)
-{
-    size_t npix = count.size();
-    vector<double> out(npix, 0.0);
-    for (size_t k = 0; k < npix; ++k)
-    {
-        int n = count[k];
-        if (n == 0) continue;
-        double *vals = const_cast<double *>(&stk[k * depth]);
-        if      (mode == StackMode::Median)    out[k] = pixelMedian   (vals, n);
-        else if (mode == StackMode::SigmaClip) out[k] = pixelSigmaClip(vals, n, kappa);
-        else { double s = 0; for (int i = 0; i < n; ++i) s += vals[i]; out[k] = s / n; }
-    }
-    return out;
 }
 
 // ---------------------------------------------------------------------------
-// Statistics helpers for frame sigma-clipping
+// Per-pixel combine helpers -- caller provides scratch[depth]; no malloc here.
+// ---------------------------------------------------------------------------
+
+// O(n) median via nth_element.
+static Pix pixelMedian(const Pix *vals, Pix *scratch, int n)
+{
+    std::copy(vals, vals + n, scratch);
+    std::nth_element(scratch, scratch + n / 2, scratch + n);
+    return scratch[n / 2];
+}
+
+// Iterative sigma-clip with in-place compaction and running sum/sum2.
+static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, int n, double kappa)
+{
+    std::copy(vals, vals + n, scratch);
+    int cnt = n;
+    for (int iter = 0; iter < 5 && cnt > 2; ++iter)
+    {
+        double sum = 0.0, sum2 = 0.0;
+        for (int i = 0; i < cnt; ++i) { double v = scratch[i]; sum += v; sum2 += v*v; }
+        double mean  = sum / cnt;
+        double sigma = std::sqrt(std::max(0.0, sum2/cnt - mean*mean));
+        if (sigma < 1e-10) break;
+        double lo = mean - kappa * sigma, hi = mean + kappa * sigma;
+        int keep = 0;
+        for (int i = 0; i < cnt; ++i)
+            if (scratch[i] >= lo && scratch[i] <= hi)
+                scratch[keep++] = scratch[i];
+        if (keep == cnt) break;
+        cnt = keep;
+    }
+    double sum = 0.0;
+    for (int i = 0; i < cnt; ++i) sum += scratch[i];
+    return (Pix)(sum / cnt);
+}
+
+// Reduce flat per-pixel stacks to final images.
+// stk layout: stk[pixelIndex * depth + frameIndex].
+// Each thread allocates one scratch buffer of size depth -- no per-pixel malloc.
+static void reduceStack3(
+    const vector<Pix> &stkR, const vector<Pix> &stkG, const vector<Pix> &stkB,
+    const vector<int> &scount, int depth,
+    StackMode mode, double kappa, int nThreads,
+    vector<Pix> &outR, vector<Pix> &outG, vector<Pix> &outB)
+{
+    size_t npix = scount.size();
+    outR.resize(npix); outG.resize(npix); outB.resize(npix);
+
+    parallelFor((int)npix, nThreads, [&](int klo, int khi)
+    {
+        vector<Pix> scratch(depth);
+        for (int k = klo; k < khi; ++k)
+        {
+            int n = scount[k];
+            if (n == 0) { outR[k] = outG[k] = outB[k] = 0.0f; continue; }
+            const Pix *vr = stkR.data() + (size_t)k * depth;
+            const Pix *vg = stkG.data() + (size_t)k * depth;
+            const Pix *vb = stkB.data() + (size_t)k * depth;
+            if (mode == StackMode::Median)
+            {
+                outR[k] = pixelMedian   (vr, scratch.data(), n);
+                outG[k] = pixelMedian   (vg, scratch.data(), n);
+                outB[k] = pixelMedian   (vb, scratch.data(), n);
+            }
+            else
+            {
+                outR[k] = pixelSigmaClip(vr, scratch.data(), n, kappa);
+                outG[k] = pixelSigmaClip(vg, scratch.data(), n, kappa);
+                outB[k] = pixelSigmaClip(vb, scratch.data(), n, kappa);
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Statistics helpers for per-frame MAD sigma-clip
 // ---------------------------------------------------------------------------
 
 static double medianOf(vector<double> v)
@@ -395,15 +568,18 @@ int main(int argc, char **argv)
     {
         cerr << "Usage: " << argv[0]
              << " [-o output.fits] [-p output.png]"
-                " [-m mean|median|sigmaclip] [-k kappa]"
+                " [-m mean|median|sigmaclip] [-k kappa] [-j threads]"
                 " frame1.fits ...\n";
         return 1;
     }
 
     string    outputPath = "stacked.fits";
     string    pngPath;
-    StackMode mode  = StackMode::Mean;
-    double    kappa = 3.0;
+    StackMode mode     = StackMode::Mean;
+    double    kappa    = 3.0;
+    int       nThreads = (int)thread::hardware_concurrency();
+    if (nThreads < 1) nThreads = 1;
+
     vector<string> inputs;
 
     for (int i = 1; i < argc; ++i)
@@ -412,6 +588,12 @@ int main(int argc, char **argv)
         if      (a == "-o" && i+1 < argc) outputPath = argv[++i];
         else if (a == "-p" && i+1 < argc) pngPath    = argv[++i];
         else if (a == "-k" && i+1 < argc) kappa      = stod(argv[++i]);
+        else if (a == "-j" && i+1 < argc)
+        {
+            nThreads = stoi(argv[++i]);
+            if (nThreads <= 0) nThreads = (int)thread::hardware_concurrency();
+            if (nThreads <  1) nThreads = 1;
+        }
         else if (a == "-m" && i+1 < argc)
         {
             string m = argv[++i];
@@ -427,32 +609,35 @@ int main(int argc, char **argv)
     const bool bayer = isBayerRGGB(inputs[0]);
 
     // ------------------------------------------------------------------
-    // Load reference and set DONUTS reference.
+    // Load reference; set DONUTS reference on green channel or full frame.
     // ------------------------------------------------------------------
+
     int bw = 0, bh = 0;
-    vector<double> refRaw = loadFITS(inputs[0], bw, bh);
+    vector<Pix> refRaw = loadFITS(inputs[0], bw, bh);
     if (refRaw.empty()) return 1;
 
+    const char *modeNames[] = { "mean", "median", "sigmaclip" };
     cout << "Reference: " << inputs[0] << "  (" << bw << "x" << bh << ")";
     if (bayer) cout << "  [RGGB Bayer]";
-    const char *modeName[] = { "mean", "median", "sigmaclip" };
-    cout << "  mode=" << modeName[(int)mode];
+    cout << "  mode=" << modeNames[(int)mode];
     if (mode == StackMode::SigmaClip) cout << " kappa=" << kappa;
-    cout << "\n";
+    cout << "  threads=" << nThreads << "\n";
 
     Donuts::Guider guider;
     if (bayer)
     {
         int gw = 0, gh = 0;
         auto refGreen = extractGreen(refRaw, bw, bh, gw, gh);
-        guider.setReference(refGreen.data(), gw, gh);
+        auto refGreenD = toDouble(refGreen);
+        guider.setReference(refGreenD.data(), gw, gh);
     }
-    else guider.setReference(refRaw.data(), bw, bh);
+    else { auto d = toDouble(refRaw); guider.setReference(d.data(), bw, bh); }
 
     // ------------------------------------------------------------------
     // Pass 1: measure transforms for all non-reference frames.
     // ------------------------------------------------------------------
-    struct FrameInfo { string path; Donuts::Transform t; bool accepted = true; string reason; };
+
+    struct FrameInfo { string path; Donuts::Transform t; bool accepted=true; string reason; };
     vector<FrameInfo> frames;
     frames.reserve(inputs.size() - 1);
 
@@ -461,23 +646,34 @@ int main(int argc, char **argv)
         FrameInfo fi;
         fi.path = inputs[i];
         int fw = 0, fh = 0;
-        vector<double> raw = loadFITS(fi.path, fw, fh);
-        if (raw.empty())            { fi.accepted = false; fi.reason = "load failed";    frames.push_back(fi); continue; }
-        if (fw != bw || fh != bh)   { fi.accepted = false; fi.reason = "size mismatch";  frames.push_back(fi); continue; }
+        vector<Pix> raw = loadFITS(fi.path, fw, fh);
+        if (raw.empty())          { fi.accepted=false; fi.reason="load failed";   frames.push_back(fi); continue; }
+        if (fw != bw || fh != bh) { fi.accepted=false; fi.reason="size mismatch"; frames.push_back(fi); continue; }
 
-        if (bayer) { int gw=0,gh=0; auto g=extractGreen(raw,fw,fh,gw,gh); fi.t=guider.measure(g.data(),gw,gh); }
-        else       { fi.t = guider.measure(raw.data(), fw, fh); }
+        if (bayer)
+        {
+            int gw=0, gh=0;
+            auto g  = extractGreen(raw, fw, fh, gw, gh);
+            auto gd = toDouble(g);
+            fi.t    = guider.measure(gd.data(), gw, gh);
+        }
+        else { auto d = toDouble(raw); fi.t = guider.measure(d.data(), fw, fh); }
 
-        if      (!fi.t.valid())                                                      { fi.accepted=false; fi.reason="SNR < 3"; }
-        else if (std::abs(fi.t.dtheta) > MAX_ROTATION_RAD)                          { fi.accepted=false; fi.reason="rotation bound"; }
-        else if (std::abs(fi.t.dx) > MAX_TRANSLATION_PX || std::abs(fi.t.dy) > MAX_TRANSLATION_PX) { fi.accepted=false; fi.reason="translation bound"; }
+        if      (!fi.t.valid())
+            { fi.accepted=false; fi.reason="SNR < 3"; }
+        else if (std::abs(fi.t.dtheta) > MAX_ROTATION_RAD)
+            { fi.accepted=false; fi.reason="rotation bound"; }
+        else if (std::abs(fi.t.dx) > MAX_TRANSLATION_PX || std::abs(fi.t.dy) > MAX_TRANSLATION_PX)
+            { fi.accepted=false; fi.reason="translation bound"; }
+
         frames.push_back(fi);
     }
 
     // Pass 1b: MAD sigma-clip on accepted transforms.
     {
         vector<double> dxV, dyV, dtV;
-        for (const auto &fi : frames) if (fi.accepted) { dxV.push_back(fi.t.dx); dyV.push_back(fi.t.dy); dtV.push_back(fi.t.dtheta); }
+        for (const auto &fi : frames)
+            if (fi.accepted) { dxV.push_back(fi.t.dx); dyV.push_back(fi.t.dy); dtV.push_back(fi.t.dtheta); }
         if (dxV.size() >= 3)
         {
             double mDx=medianOf(dxV), sDx=std::max(madSigmaOf(dxV,mDx), 0.5);
@@ -485,132 +681,148 @@ int main(int argc, char **argv)
             double mDt=medianOf(dtV), sDt=std::max(madSigmaOf(dtV,mDt), 0.5*M_PI/180.0);
             for (auto &fi : frames)
                 if (fi.accepted &&
-                    (std::abs(fi.t.dx-mDx)>MAD_NSIGMA*sDx ||
-                     std::abs(fi.t.dy-mDy)>MAD_NSIGMA*sDy ||
-                     std::abs(fi.t.dtheta-mDt)>MAD_NSIGMA*sDt))
+                    (std::abs(fi.t.dx     - mDx) > MAD_NSIGMA * sDx ||
+                     std::abs(fi.t.dy     - mDy) > MAD_NSIGMA * sDy ||
+                     std::abs(fi.t.dtheta - mDt) > MAD_NSIGMA * sDt))
                     { fi.accepted=false; fi.reason="sigma-clip"; }
         }
     }
 
-    // Print summary.
     for (size_t i = 0; i < frames.size(); ++i)
     {
         const auto &fi = frames[i];
         cout << "  [" << (i+1) << "] " << fi.path
              << "  dx=" << fi.t.dx << "  dy=" << fi.t.dy
-             << "  dtheta=" << fi.t.dtheta*180.0/M_PI << " deg"
+             << "  dtheta=" << fi.t.dtheta * 180.0 / M_PI << " deg"
              << "  snr=" << fi.t.snr;
         cout << (fi.accepted ? "  -> OK\n" : ("  -> SKIP (" + fi.reason + ")\n"));
     }
 
     // ------------------------------------------------------------------
-    // Determine accepted count; allocate accumulators.
+    // Allocate accumulators.
     // ------------------------------------------------------------------
+
     int dw = bayer ? bw/2 : bw;
     int dh = bayer ? bh/2 : bh;
     size_t npix = (size_t)dw * dh;
 
-    int nAccepted = 1; // reference always counts
+    int nAccepted = 1;
     for (const auto &fi : frames) if (fi.accepted) ++nAccepted;
-    int depth = nAccepted; // max frames per pixel in stack
+    int depth = nAccepted;
 
-    // Mean uses running sum + coverage. Median/SigmaClip stores all values.
-    vector<double> accumR(npix,0.0), accumG(npix,0.0), accumB(npix,0.0);
-    vector<int>    coverage(npix, 0);
+    vector<Pix> accumR(npix, 0.0f), accumG(npix, 0.0f), accumB(npix, 0.0f);
+    vector<int> coverage(npix, 0);
 
-    vector<double> stackR, stackG, stackB; // only for median/sigmaclip
-    vector<int>    scount;                 // per-pixel valid frame count
+    vector<Pix> stkR, stkG, stkB;
+    vector<int> scount;
     if (mode != StackMode::Mean)
     {
-        stackR.assign(npix * depth, 0.0);
-        stackG.assign(npix * depth, 0.0);
-        stackB.assign(npix * depth, 0.0);
+        stkR.assign(npix * depth, 0.0f);
+        stkG.assign(npix * depth, 0.0f);
+        stkB.assign(npix * depth, 0.0f);
         scount.assign(npix, 0);
-        cout << "Allocated " << (3*npix*depth*8/1024/1024) << " MB for pixel stacks.\n";
+        size_t mb = 3 * npix * depth * sizeof(Pix) / (1024*1024);
+        cout << "Allocated " << mb << " MB for pixel stacks.\n";
     }
 
-    // Lambda to add a debayered/mono frame into the appropriate accumulator.
-    auto accumulate = [&](const vector<double> &r, const vector<double> &g,
-                          const vector<double> &b, const vector<bool> *mask)
+    // Threaded accumulate: pixel ranges are disjoint across threads -- no locking.
+    auto accumulateFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
+                               const vector<Pix> &b, const vector<uint8_t> *maskPtr)
     {
-        for (size_t k = 0; k < npix; ++k)
+        parallelFor((int)npix, nThreads, [&](int klo, int khi)
         {
-            if (mask && !(*mask)[k]) continue;
-            if (mode == StackMode::Mean)
+            for (int k = klo; k < khi; ++k)
             {
-                accumR[k] += r[k]; accumG[k] += g[k]; accumB[k] += b[k];
-                coverage[k]++;
+                if (maskPtr && !(*maskPtr)[k]) continue;
+                if (mode == StackMode::Mean)
+                {
+                    accumR[k] += r[k]; accumG[k] += g[k]; accumB[k] += b[k];
+                    coverage[k]++;
+                }
+                else
+                {
+                    int f = scount[k]++;
+                    stkR[(size_t)k*depth + f] = r[k];
+                    stkG[(size_t)k*depth + f] = g[k];
+                    stkB[(size_t)k*depth + f] = b[k];
+                }
             }
-            else
-            {
-                int f = scount[k]++;
-                stackR[k*depth + f] = r[k];
-                stackG[k*depth + f] = g[k];
-                stackB[k*depth + f] = b[k];
-            }
-        }
+        });
     };
 
     // ------------------------------------------------------------------
-    // Add reference (no transform; all pixels valid).
+    // Add reference frame (no transform; all pixels valid).
     // ------------------------------------------------------------------
+
     {
-        vector<double> r, g, b;
-        if (bayer) { int tw=0,th=0; debayerRGGB(refRaw,bw,bh,r,g,b,tw,th); }
+        vector<Pix> r, g, b;
+        if (bayer) { int tw=0,th=0; debayerRGGB(refRaw, bw, bh, r, g, b, tw, th); }
         else       { r = refRaw; g = refRaw; b = refRaw; }
-        accumulate(r, g, b, nullptr); // null mask = all valid
+        accumulateFrame(r, g, b, nullptr);
     }
 
     // ------------------------------------------------------------------
-    // Pass 2: load, debayer, align, accumulate accepted frames.
+    // Pass 2: load, align, accumulate each accepted frame.
     // ------------------------------------------------------------------
+
     int stackCount = 1;
     for (const auto &fi : frames)
     {
         if (!fi.accepted) continue;
-        int fw=0,fh=0;
-        vector<double> raw = loadFITS(fi.path, fw, fh);
+        int fw=0, fh=0;
+        vector<Pix> raw = loadFITS(fi.path, fw, fh);
         if (raw.empty()) continue;
 
-        vector<double> r, g, b;
-        if (bayer) { int tw=0,th=0; debayerRGGB(raw,fw,fh,r,g,b,tw,th); }
+        vector<Pix> r, g, b;
+        if (bayer) { int tw=0,th=0; debayerRGGB(raw, fw, fh, r, g, b, tw, th); }
         else       { r = raw; g = raw; b = raw; }
 
-        vector<bool> mask;
-        auto ar = alignFrame(r, dw, dh, -fi.t.dx, -fi.t.dy, -fi.t.dtheta, &mask);
-        auto ag = alignFrame(g, dw, dh, -fi.t.dx, -fi.t.dy, -fi.t.dtheta);
-        auto ab = alignFrame(b, dw, dh, -fi.t.dx, -fi.t.dy, -fi.t.dtheta);
+        vector<Pix>     dstR(npix), dstG(npix), dstB(npix);
+        vector<uint8_t> mask(npix, 0);
 
-        accumulate(ar, ag, ab, &mask);
+        parallelFor(dh, nThreads, [&](int ylo, int yhi)
+        {
+            alignFrame3rows(r, g, b, dw, dh,
+                            -fi.t.dx, -fi.t.dy, -fi.t.dtheta,
+                            dstR, dstG, dstB, mask, ylo, yhi);
+        });
+
+        accumulateFrame(dstR, dstG, dstB, &mask);
         ++stackCount;
     }
 
-    cout << "\nStacked " << stackCount << "/" << (int)inputs.size() << " frames -> " << outputPath << "\n";
+    cout << "\nStacked " << stackCount << "/" << (int)inputs.size()
+         << " frames -> " << outputPath << "\n";
 
     // ------------------------------------------------------------------
     // Reduce to final image.
     // ------------------------------------------------------------------
-    vector<double> finalR(npix), finalG(npix), finalB(npix);
+
+    vector<Pix> finalR(npix), finalG(npix), finalB(npix);
+
     if (mode == StackMode::Mean)
     {
-        for (size_t k = 0; k < npix; ++k)
+        parallelFor((int)npix, nThreads, [&](int klo, int khi)
         {
-            double inv = coverage[k] > 0 ? 1.0 / coverage[k] : 0.0;
-            finalR[k] = accumR[k] * inv;
-            finalG[k] = accumG[k] * inv;
-            finalB[k] = accumB[k] * inv;
-        }
+            for (int k = klo; k < khi; ++k)
+            {
+                float inv = coverage[k] > 0 ? 1.0f / coverage[k] : 0.0f;
+                finalR[k] = accumR[k] * inv;
+                finalG[k] = accumG[k] * inv;
+                finalB[k] = accumB[k] * inv;
+            }
+        });
     }
     else
     {
-        finalR = reduceStack(stackR, scount, depth, mode, kappa);
-        finalG = reduceStack(stackG, scount, depth, mode, kappa);
-        finalB = reduceStack(stackB, scount, depth, mode, kappa);
+        reduceStack3(stkR, stkG, stkB, scount, depth, mode, kappa, nThreads,
+                     finalR, finalG, finalB);
     }
 
     // ------------------------------------------------------------------
     // Write outputs.
     // ------------------------------------------------------------------
+
     if (bayer)
     {
         if (!writeFITS3(outputPath, finalR, finalG, finalB, dw, dh)) return 1;
@@ -623,10 +835,10 @@ int main(int argc, char **argv)
     }
     else
     {
-        if (!writeFITS(outputPath, finalR, bw, bh)) return 1;
+        if (!writeFITS(outputPath, finalR, dw, dh)) return 1;
         if (!pngPath.empty())
         {
-            if (!writePNG(pngPath, finalR, finalG, finalB, dw, dh)) return 1;
+            if (!writePNG(pngPath, finalR, finalR, finalR, dw, dh)) return 1;
             cout << "PNG:    " << pngPath << "\n";
         }
     }
