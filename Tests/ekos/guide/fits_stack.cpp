@@ -128,29 +128,28 @@ static vector<Pix> loadFITS(const string &path, int &w, int &h)
     fits_get_img_size(fptr, 2, naxes, &s);
     w = (int)naxes[0];
     h = (int)naxes[1];
-    // Read as double for correct BZERO/BSCALE handling, then narrow to float.
-    vector<double> tmp((size_t)w * h);
-    fits_read_img(fptr, TDOUBLE, 1, (long)w * h, nullptr, tmp.data(), nullptr, &s);
+    // cfitsio applies BZERO/BSCALE correctly for TFLOAT; no double intermediate needed.
+    vector<Pix> buf((size_t)w * h);
+    fits_read_img(fptr, TFLOAT, 1, (long)w * h, nullptr, buf.data(), nullptr, &s);
     fits_close_file(fptr, &s);
     if (s) { cerr << "Read error on " << path << " (status " << s << ")\n"; return {}; }
-    vector<Pix> buf(tmp.size());
-    for (size_t i = 0; i < tmp.size(); ++i) buf[i] = (Pix)tmp[i];
     return buf;
 }
 
-static bool isBayerRGGB(const string &path)
+// Returns the trimmed BAYERPAT string, or "" if the key is absent/unreadable.
+static string readBayerPat(const string &path)
 {
     fitsfile *fptr = nullptr;
     int s = 0;
-    if (fits_open_file(&fptr, path.c_str(), READONLY, &s)) return false;
+    if (fits_open_file(&fptr, path.c_str(), READONLY, &s)) return "";
     char value[FLEN_VALUE] = {};
     fits_read_key(fptr, TSTRING, "BAYERPAT", value, nullptr, &s);
     fits_close_file(fptr, &s);
-    if (s != 0) return false;
+    if (s != 0) return "";
     string pat(value);
     pat.erase(0, pat.find_first_not_of(" '\""));
     pat.erase(pat.find_last_not_of(" '\"") + 1);
-    return pat == "RGGB";
+    return pat;
 }
 
 static bool writeFITS(const string &path, const vector<Pix> &pixels, int w, int h)
@@ -192,8 +191,9 @@ static bool writeFITS3(const string &path,
 static vector<Pix> subtractMedian(vector<Pix> ch)
 {
     vector<Pix> s(ch);
-    std::sort(s.begin(), s.end());
-    Pix med = s[s.size() / 2];
+    auto mid = s.begin() + s.size() / 2;
+    std::nth_element(s.begin(), mid, s.end());
+    Pix med = *mid;
     for (Pix &v : ch) v -= med;
     return ch;
 }
@@ -238,7 +238,7 @@ static bool writePNG(const string &path,
 
     png_structp png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     png_infop   info = png_create_info_struct(png);
-    if (setjmp(png_jmpbuf(png))) { fclose(fp); return false; }
+    if (setjmp(png_jmpbuf(png))) { png_destroy_write_struct(&png, &info); fclose(fp); return false; }
 
     png_init_io(png, fp);
     png_set_IHDR(png, info, (png_uint_32)w, (png_uint_32)h,
@@ -337,21 +337,23 @@ static pair<int,int> interiorXRange(double sx0, double sy0,
 {
     double lo = 0.0, hi = (double)(w - 1);
 
-    // sx constraint: dsx_dx*x + sx0 in [1, w-2)
+    // sx constraint: dsx_dx*x + sx0 in [1, w-2).
+    // Epsilon is subtracted in *source* space so it correctly shrinks the safe
+    // dest-x range regardless of slope sign (negative slope inverts the mapping).
     if (std::abs(dsx_dx) > 1e-12)
     {
-        double a = (1.0   - sx0) / dsx_dx;
-        double b = (w-2.0 - sx0) / dsx_dx - 1e-9;
+        double a = (1.0         - sx0) / dsx_dx;
+        double b = (w-2.0-1e-9  - sx0) / dsx_dx;
         if (dsx_dx > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
         else            { lo = std::max(lo, b); hi = std::min(hi, a); }
     }
     else if (sx0 < 1.0 || sx0 >= w - 2.0) return {0, -1};
 
-    // sy constraint: dsy_dx*x + sy0 in [1, h-2)
+    // sy constraint: dsy_dx*x + sy0 in [1, h-2).
     if (std::abs(dsy_dx) > 1e-12)
     {
-        double a = (1.0   - sy0) / dsy_dx;
-        double b = (h-2.0 - sy0) / dsy_dx - 1e-9;
+        double a = (1.0         - sy0) / dsy_dx;
+        double b = (h-2.0-1e-9  - sy0) / dsy_dx;
         if (dsy_dx > 0) { lo = std::max(lo, a); hi = std::min(hi, b); }
         else            { lo = std::max(lo, b); hi = std::min(hi, a); }
     }
@@ -384,86 +386,95 @@ static void alignFrame3rows(
 
         auto [xInLo, xInHi] = interiorXRange(sx0, sy0, m.a, m.c, w, h);
 
-        for (int x = 0; x < w; ++x)
+        // Split the row into three segments to hoist the fast/slow branch out of
+        // the inner loop: left border [0, xInLo), interior [xInLo, xInHi+1), right border.
+        // The interior is the vast majority of pixels at typical rotation angles.
+
+        // Helper: slow (clamped) path for a single pixel.
+        auto slowPixel = [&](int x)
         {
             const double sx = m.a * x + sx0;
             const double sy = m.c * x + sy0;
             const size_t k  = (size_t)y * w + x;
-
-            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h)
-            {
-                mask[k] = 0;
-                continue;
-            }
-
+            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) { mask[k] = 0; return; }
             const int   ix = (int)sx, iy = (int)sy;
             const float fx = (float)(sx - ix), fy = (float)(sy - iy);
             float wx[4], wy[4];
             cubicWeights4(fx, wx);
             cubicWeights4(fy, wy);
-
             mask[k] = 1;
+            float vR = 0.0f, vG = 0.0f, vB = 0.0f;
+            for (int dr = -1; dr <= 2; ++dr)
+            {
+                const int   py  = std::max(0, std::min(h - 1, iy + dr));
+                const float wyd = wy[dr + 1];
+                for (int dc = -1; dc <= 2; ++dc)
+                {
+                    const int    px  = std::max(0, std::min(w - 1, ix + dc));
+                    const float  wdc = wx[dc + 1] * wyd;
+                    const size_t s   = (size_t)py * w + px;
+                    vR += wdc * srcR[s];
+                    vG += wdc * srcG[s];
+                    vB += wdc * srcB[s];
+                }
+            }
+            dstR[k] = vR; dstG[k] = vG; dstB[k] = vB;
+        };
 
-            if (x >= xInLo && x <= xInHi)
-            {
-                // Fast path: all 16 neighbors in-bounds, no clamping needed.
+        // Left border.
+        for (int x = 0; x < xInLo; ++x) slowPixel(x);
+
+        // Interior: no bounds clamping needed.
+        for (int x = xInLo; x <= xInHi; ++x)
+        {
+            const double sx = m.a * x + sx0;
+            const double sy = m.c * x + sy0;
+            const size_t k  = (size_t)y * w + x;
+            const int   ix = (int)sx, iy = (int)sy;
+            const float fx = (float)(sx - ix), fy = (float)(sy - iy);
+            float wx[4], wy[4];
+            cubicWeights4(fx, wx);
+            cubicWeights4(fy, wy);
+            mask[k] = 1;
 #ifdef __ARM_NEON
-                const float32x4_t wxv = vld1q_f32(wx);
-                float accR = 0.0f, accG = 0.0f, accB = 0.0f;
-                for (int dr = 0; dr < 4; ++dr)
-                {
-                    const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
-                    const float  wyd  = wy[dr];
-                    accR += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcR.data() + base), wxv));
-                    accG += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcG.data() + base), wxv));
-                    accB += wyd * vaddvq_f32(vmulq_f32(vld1q_f32(srcB.data() + base), wxv));
-                }
-                dstR[k] = accR;
-                dstG[k] = accG;
-                dstB[k] = accB;
-#else
-                float vR = 0.0f, vG = 0.0f, vB = 0.0f;
-                for (int dr = 0; dr < 4; ++dr)
-                {
-                    const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
-                    const float  wyd  = wy[dr];
-                    for (int dc = 0; dc < 4; ++dc)
-                    {
-                        const float  wdc = wx[dc] * wyd;
-                        const size_t s   = base + dc;
-                        vR += wdc * srcR[s];
-                        vG += wdc * srcG[s];
-                        vB += wdc * srcB[s];
-                    }
-                }
-                dstR[k] = vR;
-                dstG[k] = vG;
-                dstB[k] = vB;
-#endif
-            }
-            else
+            // Accumulate 4-wide vectors over the 4 rows; one vaddvq_f32 per
+            // channel at the end instead of 4 -- saves 9 horizontal reductions.
+            const float32x4_t wxv = vld1q_f32(wx);
+            float32x4_t accVR = vdupq_n_f32(0.0f);
+            float32x4_t accVG = vdupq_n_f32(0.0f);
+            float32x4_t accVB = vdupq_n_f32(0.0f);
+            for (int dr = 0; dr < 4; ++dr)
             {
-                // Slow path: clamp each of the 16 source coordinates.
-                float vR = 0.0f, vG = 0.0f, vB = 0.0f;
-                for (int dr = -1; dr <= 2; ++dr)
-                {
-                    const int   py  = std::max(0, std::min(h - 1, iy + dr));
-                    const float wyd = wy[dr + 1];
-                    for (int dc = -1; dc <= 2; ++dc)
-                    {
-                        const int   px  = std::max(0, std::min(w - 1, ix + dc));
-                        const float wdc = wx[dc + 1] * wyd;
-                        const size_t s  = (size_t)py * w + px;
-                        vR += wdc * srcR[s];
-                        vG += wdc * srcG[s];
-                        vB += wdc * srcB[s];
-                    }
-                }
-                dstR[k] = vR;
-                dstG[k] = vG;
-                dstB[k] = vB;
+                const size_t      base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                const float32x4_t wyd  = vdupq_n_f32(wy[dr]);
+                accVR = vmlaq_f32(accVR, vmulq_f32(vld1q_f32(srcR.data() + base), wxv), wyd);
+                accVG = vmlaq_f32(accVG, vmulq_f32(vld1q_f32(srcG.data() + base), wxv), wyd);
+                accVB = vmlaq_f32(accVB, vmulq_f32(vld1q_f32(srcB.data() + base), wxv), wyd);
             }
+            dstR[k] = vaddvq_f32(accVR);
+            dstG[k] = vaddvq_f32(accVG);
+            dstB[k] = vaddvq_f32(accVB);
+#else
+            float vR = 0.0f, vG = 0.0f, vB = 0.0f;
+            for (int dr = 0; dr < 4; ++dr)
+            {
+                const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                const float  wyd  = wy[dr];
+                for (int dc = 0; dc < 4; ++dc)
+                {
+                    const float  wdc = wx[dc] * wyd;
+                    const size_t s   = base + dc;
+                    vR += wdc * srcR[s];
+                    vG += wdc * srcG[s];
+                    vB += wdc * srcB[s];
+                }
+            }
+            dstR[k] = vR; dstG[k] = vG; dstB[k] = vB;
+#endif
         }
+
+        // Right border.
+        for (int x = xInHi + 1; x < w; ++x) slowPixel(x);
     }
 }
 
@@ -583,7 +594,7 @@ int main(int argc, char **argv)
     {
         cerr << "Usage: " << argv[0]
              << " [-o output.fits] [-p output.png]"
-                " [-m mean|median|sigmaclip] [-k kappa] [-j threads]"
+                " [-m mean|median|sigmaclip|wstream] [-k kappa] [-j threads]"
                 " frame1.fits ...\n";
         return 1;
     }
@@ -602,10 +613,15 @@ int main(int argc, char **argv)
         string a = argv[i];
         if      (a == "-o" && i+1 < argc) outputPath = argv[++i];
         else if (a == "-p" && i+1 < argc) pngPath    = argv[++i];
-        else if (a == "-k" && i+1 < argc) kappa      = stod(argv[++i]);
+        else if (a == "-k" && i+1 < argc)
+        {
+            try { kappa = stod(argv[++i]); }
+            catch (...) { cerr << "Invalid kappa: " << argv[i] << "\n"; return 1; }
+        }
         else if (a == "-j" && i+1 < argc)
         {
-            nThreads = stoi(argv[++i]);
+            try { nThreads = stoi(argv[++i]); }
+            catch (...) { cerr << "Invalid thread count: " << argv[i] << "\n"; return 1; }
             if (nThreads <= 0) nThreads = (int)thread::hardware_concurrency();
             if (nThreads <  1) nThreads = 1;
         }
@@ -622,7 +638,14 @@ int main(int argc, char **argv)
     if (inputs.empty()) { cerr << "No input files.\n"; return 1; }
     std::sort(inputs.begin(), inputs.end());
 
-    const bool bayer = isBayerRGGB(inputs[0]);
+    const string refPat = readBayerPat(inputs[0]);
+    if (!refPat.empty() && refPat != "RGGB")
+    {
+        cerr << "Unsupported Bayer pattern \"" << refPat << "\" in " << inputs[0]
+             << " -- only RGGB is supported.\n";
+        return 1;
+    }
+    const bool bayer = (refPat == "RGGB");
 
     // ------------------------------------------------------------------
     // Load reference; set DONUTS reference on green channel or full frame.
@@ -666,6 +689,17 @@ int main(int argc, char **argv)
         vector<Pix> raw = loadFITS(fi.path, fw, fh);
         if (raw.empty())          { fi.accepted=false; fi.reason="load failed";   frames.push_back(fi); continue; }
         if (fw != bw || fh != bh) { fi.accepted=false; fi.reason="size mismatch"; frames.push_back(fi); continue; }
+        {
+            string pat = readBayerPat(fi.path);
+            if (pat != refPat)
+            {
+                fi.accepted = false;
+                fi.reason   = "Bayer pattern mismatch (ref=" + (refPat.empty() ? "mono" : refPat)
+                              + " frame=" + (pat.empty() ? "mono" : pat) + ")";
+                frames.push_back(fi);
+                continue;
+            }
+        }
 
         if (bayer)
         {
@@ -734,11 +768,26 @@ int main(int argc, char **argv)
     vector<int> scount;
     if (mode == StackMode::Median || mode == StackMode::SigmaClip)
     {
-        stkR.assign(npix * depth, 0.0f);
-        stkG.assign(npix * depth, 0.0f);
-        stkB.assign(npix * depth, 0.0f);
+        size_t mb = 3 * npix * (size_t)depth * sizeof(Pix) / (1024*1024);
+        if (mb > 4096)
+        {
+            cerr << "Warning: median/sigmaclip needs ~" << mb << " MB for " << depth
+                 << " frames at this resolution.\n"
+                 << "  Consider -m wstream for constant-memory streaming rejection.\n";
+        }
+        try
+        {
+            stkR.assign(npix * depth, 0.0f);
+            stkG.assign(npix * depth, 0.0f);
+            stkB.assign(npix * depth, 0.0f);
+        }
+        catch (const std::bad_alloc &)
+        {
+            cerr << "Out of memory allocating " << mb << " MB for pixel stacks.\n"
+                 << "  Use -m wstream for streaming rejection with constant memory.\n";
+            return 1;
+        }
         scount.assign(npix, 0);
-        size_t mb = 3 * npix * depth * sizeof(Pix) / (1024*1024);
         cout << "Allocated " << mb << " MB for pixel stacks.\n";
     }
 
