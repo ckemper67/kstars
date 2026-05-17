@@ -60,6 +60,7 @@
 #include <fitsio.h>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <png.h>
 #include <string>
@@ -529,39 +530,51 @@ static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, Pix *devbuf,
     return cnt > 0 ? (Pix)(sum / cnt) : (Pix)vals[0];
 }
 
-// Reduce flat per-pixel stacks to final images.
-// stk layout: stk[pixelIndex * depth + frameIndex].
-// Each thread allocates one scratch buffer of size depth -- no per-pixel malloc.
+// Reduce frame-major pixel stacks to final images.
+// stk layout: stk[frameIndex][pixelIndex]; NaN marks masked-out pixels.
+// Gathering non-NaN values per pixel is strided (one hop per frame) but this
+// is a one-time pass so cache miss cost is acceptable.
+// Each thread allocates scratch buffers of size nFrames -- no per-pixel malloc.
 static void reduceStack3(
-    const vector<Pix> &stkR, const vector<Pix> &stkG, const vector<Pix> &stkB,
-    const vector<int> &scount, int depth,
+    const vector<vector<Pix>> &stkR,
+    const vector<vector<Pix>> &stkG,
+    const vector<vector<Pix>> &stkB,
+    size_t npix,
     StackMode mode, double kappa, int nThreads,
     vector<Pix> &outR, vector<Pix> &outG, vector<Pix> &outB)
 {
-    size_t npix = scount.size();
+    const int nFrames = (int)stkR.size();
     outR.resize(npix); outG.resize(npix); outB.resize(npix);
 
     parallelFor((int)npix, nThreads, [&](int klo, int khi)
     {
-        vector<Pix> scratch(depth), devbuf(depth);
+        vector<Pix> gR(nFrames), gG(nFrames), gB(nFrames);
+        vector<Pix> scratch(nFrames), devbuf(nFrames);
         for (int k = klo; k < khi; ++k)
         {
-            int n = scount[k];
+            // Gather valid (non-NaN) values for this pixel across all frames.
+            int n = 0;
+            for (int f = 0; f < nFrames; ++f)
+            {
+                Pix v = stkR[f][k];
+                if (std::isnan(v)) continue;
+                gR[n] = v;
+                gG[n] = stkG[f][k];
+                gB[n] = stkB[f][k];
+                ++n;
+            }
             if (n == 0) { outR[k] = outG[k] = outB[k] = 0.0f; continue; }
-            const Pix *vr = stkR.data() + (size_t)k * depth;
-            const Pix *vg = stkG.data() + (size_t)k * depth;
-            const Pix *vb = stkB.data() + (size_t)k * depth;
             if (mode == StackMode::Median)
             {
-                outR[k] = pixelMedian   (vr, scratch.data(), n);
-                outG[k] = pixelMedian   (vg, scratch.data(), n);
-                outB[k] = pixelMedian   (vb, scratch.data(), n);
+                outR[k] = pixelMedian   (gR.data(), scratch.data(), n);
+                outG[k] = pixelMedian   (gG.data(), scratch.data(), n);
+                outB[k] = pixelMedian   (gB.data(), scratch.data(), n);
             }
             else
             {
-                outR[k] = pixelSigmaClip(vr, scratch.data(), devbuf.data(), n, kappa);
-                outG[k] = pixelSigmaClip(vg, scratch.data(), devbuf.data(), n, kappa);
-                outB[k] = pixelSigmaClip(vb, scratch.data(), devbuf.data(), n, kappa);
+                outR[k] = pixelSigmaClip(gR.data(), scratch.data(), devbuf.data(), n, kappa);
+                outG[k] = pixelSigmaClip(gG.data(), scratch.data(), devbuf.data(), n, kappa);
+                outB[k] = pixelSigmaClip(gB.data(), scratch.data(), devbuf.data(), n, kappa);
             }
         }
     });
@@ -759,36 +772,26 @@ int main(int argc, char **argv)
 
     int nAccepted = 1;
     for (const auto &fi : frames) if (fi.accepted) ++nAccepted;
-    int depth = nAccepted;
 
     vector<Pix> accumR(npix, 0.0f), accumG(npix, 0.0f), accumB(npix, 0.0f);
     vector<int> coverage(npix, 0);
 
-    vector<Pix> stkR, stkG, stkB;
-    vector<int> scount;
+    // Frame-major stacks: stkFrames*[frameIndex][pixelIndex].
+    // Each accepted frame appends one vector<Pix>(npix) -- one allocation per frame,
+    // no upfront bulk allocation. NaN marks masked-out pixels (border regions).
+    vector<vector<Pix>> stkFramesR, stkFramesG, stkFramesB;
     if (mode == StackMode::Median || mode == StackMode::SigmaClip)
     {
-        size_t mb = 3 * npix * (size_t)depth * sizeof(Pix) / (1024*1024);
+        size_t mb = 3 * npix * (size_t)nAccepted * sizeof(Pix) / (1024*1024);
         if (mb > 4096)
-        {
-            cerr << "Warning: median/sigmaclip needs ~" << mb << " MB for " << depth
-                 << " frames at this resolution.\n"
-                 << "  Consider -m wstream for constant-memory streaming rejection.\n";
-        }
-        try
-        {
-            stkR.assign(npix * depth, 0.0f);
-            stkG.assign(npix * depth, 0.0f);
-            stkB.assign(npix * depth, 0.0f);
-        }
-        catch (const std::bad_alloc &)
-        {
-            cerr << "Out of memory allocating " << mb << " MB for pixel stacks.\n"
-                 << "  Use -m wstream for streaming rejection with constant memory.\n";
-            return 1;
-        }
-        scount.assign(npix, 0);
-        cout << "Allocated " << mb << " MB for pixel stacks.\n";
+            cerr << "Warning: median/sigmaclip estimated ~" << mb << " MB for "
+                 << nAccepted << " frames; consider -m wstream.\n";
+        else
+            cout << "Pixel stacks: ~" << mb << " MB estimated ("
+                 << nAccepted << " frames, allocated per-frame).\n";
+        stkFramesR.reserve(nAccepted);
+        stkFramesG.reserve(nAccepted);
+        stkFramesB.reserve(nAccepted);
     }
 
     // Welford streaming state: {mean, M2, count} per pixel -- O(pixels) memory
@@ -805,29 +808,52 @@ int main(int argc, char **argv)
         cout << "Welford streaming: " << mb << " MB (constant, frame-count-independent).\n";
     }
 
+    const Pix kNaN = std::numeric_limits<Pix>::quiet_NaN();
+
     // Threaded accumulate: pixel ranges are disjoint across threads -- no locking.
     auto accumulateFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
                                const vector<Pix> &b, const vector<uint8_t> *maskPtr)
     {
-        parallelFor((int)npix, nThreads, [&](int klo, int khi)
+        if (mode == StackMode::Mean)
         {
-            for (int k = klo; k < khi; ++k)
+            parallelFor((int)npix, nThreads, [&](int klo, int khi)
             {
-                if (maskPtr && !(*maskPtr)[k]) continue;
-                if (mode == StackMode::Mean)
+                for (int k = klo; k < khi; ++k)
                 {
+                    if (maskPtr && !(*maskPtr)[k]) continue;
                     accumR[k] += r[k]; accumG[k] += g[k]; accumB[k] += b[k];
                     coverage[k]++;
                 }
-                else
-                {
-                    int f = scount[k]++;
-                    stkR[(size_t)k*depth + f] = r[k];
-                    stkG[(size_t)k*depth + f] = g[k];
-                    stkB[(size_t)k*depth + f] = b[k];
-                }
+            });
+        }
+        else
+        {
+            // Push a NaN-filled frame layer, then fill valid pixels in parallel.
+            // push_back is serial (must complete before parallelFor captures the ptrs).
+            try
+            {
+                stkFramesR.push_back(vector<Pix>(npix, kNaN));
+                stkFramesG.push_back(vector<Pix>(npix, kNaN));
+                stkFramesB.push_back(vector<Pix>(npix, kNaN));
             }
-        });
+            catch (const std::bad_alloc &)
+            {
+                cerr << "Out of memory adding frame to pixel stack (frame "
+                     << stkFramesR.size() << "). Use -m wstream.\n";
+                return;
+            }
+            Pix *fr = stkFramesR.back().data();
+            Pix *fg = stkFramesG.back().data();
+            Pix *fb = stkFramesB.back().data();
+            parallelFor((int)npix, nThreads, [&](int klo, int khi)
+            {
+                for (int k = klo; k < khi; ++k)
+                {
+                    if (maskPtr && !(*maskPtr)[k]) continue;
+                    fr[k] = r[k]; fg[k] = g[k]; fb[k] = b[k];
+                }
+            });
+        }
     };
 
     // Welford online update for streaming sigma-clip.
@@ -944,8 +970,8 @@ int main(int argc, char **argv)
     }
     else
     {
-        reduceStack3(stkR, stkG, stkB, scount, depth, mode, kappa, nThreads,
-                     finalR, finalG, finalB);
+        reduceStack3(stkFramesR, stkFramesG, stkFramesB, npix,
+                     mode, kappa, nThreads, finalR, finalG, finalB);
     }
 
     // ------------------------------------------------------------------
