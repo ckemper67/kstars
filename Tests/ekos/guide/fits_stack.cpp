@@ -26,7 +26,7 @@
  *   - Per-row interior x-range precomputed analytically to split fast/slow paths
  *   - Thread-parallel warp, accumulate, and reduce via std::thread (-j N)
  *   - Per-thread scratch buffer eliminates per-pixel malloc in median/sigmaclip
- *   - In-place sigma-clip compaction with running stats (no vector<bool>)
+ *   - Per-pixel median+MAD sigma-clip (robust to satellites/airplane trails)
  *   - uint8_t mask (no bit-pack overhead of vector<bool>)
  *
  * Build (from repo root):
@@ -476,19 +476,33 @@ static Pix pixelMedian(const Pix *vals, Pix *scratch, int n)
     return scratch[n / 2];
 }
 
-// Iterative sigma-clip with in-place compaction and running sum/sum2.
-static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, int n, double kappa)
+// Iterative median+MAD sigma-clip with in-place compaction.
+//
+// Uses median as the centre and 1.4826*MAD as the scale estimate.
+// Mean+stddev fails on satellite/airplane trails: a single pixel at 950
+// among background ~12 inflates mean to ~169 and sigma to ~383, so the
+// outlier is inside the 3-sigma band (hi = 1317) and survives every pass.
+// Median = 12.5 and MAD-sigma = 1.48 clips 950 immediately (hi = 16.9).
+//
+// devbuf must be caller-allocated with capacity >= n (same size as scratch).
+static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, Pix *devbuf,
+                           int n, double kappa)
 {
     std::copy(vals, vals + n, scratch);
     int cnt = n;
     for (int iter = 0; iter < 5 && cnt > 2; ++iter)
     {
-        double sum = 0.0, sum2 = 0.0;
-        for (int i = 0; i < cnt; ++i) { double v = scratch[i]; sum += v; sum2 += v*v; }
-        double mean  = sum / cnt;
-        double sigma = std::sqrt(std::max(0.0, sum2/cnt - mean*mean));
+        // Robust centre: median via nth_element (O(n) average).
+        std::nth_element(scratch, scratch + cnt/2, scratch + cnt);
+        double med = scratch[cnt/2];
+
+        // Robust scale: MAD = median(|x - median|), sigma = 1.4826 * MAD.
+        for (int i = 0; i < cnt; ++i) devbuf[i] = std::abs(scratch[i] - (Pix)med);
+        std::nth_element(devbuf, devbuf + cnt/2, devbuf + cnt);
+        double sigma = 1.4826 * devbuf[cnt/2];
         if (sigma < 1e-10) break;
-        double lo = mean - kappa * sigma, hi = mean + kappa * sigma;
+
+        double lo = med - kappa * sigma, hi = med + kappa * sigma;
         int keep = 0;
         for (int i = 0; i < cnt; ++i)
             if (scratch[i] >= lo && scratch[i] <= hi)
@@ -498,7 +512,7 @@ static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, int n, double kappa)
     }
     double sum = 0.0;
     for (int i = 0; i < cnt; ++i) sum += scratch[i];
-    return (Pix)(sum / cnt);
+    return cnt > 0 ? (Pix)(sum / cnt) : (Pix)vals[0];
 }
 
 // Reduce flat per-pixel stacks to final images.
@@ -515,7 +529,7 @@ static void reduceStack3(
 
     parallelFor((int)npix, nThreads, [&](int klo, int khi)
     {
-        vector<Pix> scratch(depth);
+        vector<Pix> scratch(depth), devbuf(depth);
         for (int k = klo; k < khi; ++k)
         {
             int n = scount[k];
@@ -531,9 +545,9 @@ static void reduceStack3(
             }
             else
             {
-                outR[k] = pixelSigmaClip(vr, scratch.data(), n, kappa);
-                outG[k] = pixelSigmaClip(vg, scratch.data(), n, kappa);
-                outB[k] = pixelSigmaClip(vb, scratch.data(), n, kappa);
+                outR[k] = pixelSigmaClip(vr, scratch.data(), devbuf.data(), n, kappa);
+                outG[k] = pixelSigmaClip(vg, scratch.data(), devbuf.data(), n, kappa);
+                outB[k] = pixelSigmaClip(vb, scratch.data(), devbuf.data(), n, kappa);
             }
         }
     });
