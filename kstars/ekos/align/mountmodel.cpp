@@ -5,9 +5,11 @@
  */
 
 #include "mountmodel.h"
+#include "mountmodelsort.h"
 
 #include "align.h"
 #include "indi/indimount.h"
+#include <indicom.h>
 #include "Options.h"
 #include "kstars.h"
 #include "kstarsdata.h"
@@ -31,6 +33,7 @@
 
 // Qt version calming
 #include <qtendl.h>
+#include <vector>
 
 #include "haltonsequence.h"
 
@@ -459,57 +462,79 @@ void MountModel::swapAlignPoints(int firstPt, int secondPt)
 
 void MountModel::sortTableRows(int fromRow, const SkyPoint &start)
 {
-    int rowCount = alignTable->rowCount();
+    const int rowCount = alignTable->rowCount();
     if (fromRow >= rowCount)
         return;
 
-    auto skyPointAt = [&](int row) -> SkyPoint
-    {
-        return SkyPoint(dms::fromString(alignTable->item(row, 0)->text(), false),
-                        dms::fromString(alignTable->item(row, 1)->text(), true));
-    };
+    auto *mount  = m_AlignInstance->mount();
+    auto *data   = KStarsData::Instance();
+    const bool isAltAz = mount && !mount->getProperty("EQUATORIAL_COORD").isValid();
+    const double lst   = data->lst()->Hours();
 
-    // Find the row in [fromRow, rowCount) closest to start and swap it to fromRow.
-    SkyPoint ref = start;
-    dms bestDiff(360);
-    int bestIndex = fromRow;
+    // Pre-parse valid rows; pre-compute az/alt once for alt-az mounts.
+    std::vector<MountSortPoint> pts;
+    std::vector<int>            rows;  // table row index for each element of pts
+    pts.reserve(rowCount - fromRow);
+    rows.reserve(rowCount - fromRow);
+
     for (int i = fromRow; i < rowCount; i++)
     {
         if (!alignTable->item(i, 0) || !alignTable->item(i, 1))
             continue;
-        SkyPoint sp = skyPointAt(i);
-        dms diff = ref.angularDistanceTo(&sp);
-        if (diff.Degrees() < bestDiff.Degrees())
+        SkyPoint eq(dms::fromString(alignTable->item(i, 0)->text(), false),
+                    dms::fromString(alignTable->item(i, 1)->text(), true));
+        MountSortPoint sp;
+        sp.ra_h    = eq.ra().Hours();
+        sp.dec_deg = eq.dec().Degrees();
+        if (isAltAz)
         {
-            bestIndex = i;
-            bestDiff  = diff;
+            eq.EquatorialToHorizontal(data->lst(), data->geo()->lat());
+            sp.az_deg  = eq.az().Degrees();
+            sp.alt_deg = eq.alt().Degrees();
         }
+        pts.push_back(sp);
+        rows.push_back(i);
     }
-    if (bestIndex != fromRow)
-        swapAlignPoints(bestIndex, fromRow);
+    if (pts.empty())
+        return;
 
-    // Nearest-neighbour for the rest of the range.
-    for (int i = fromRow; i < rowCount - 1; i++)
+    // Build start in the same coordinate space.
+    MountSortPoint startPt;
+    startPt.ra_h    = start.ra().Hours();
+    startPt.dec_deg = start.dec().Degrees();
+    if (isAltAz)
     {
-        if (!alignTable->item(i, 0) || !alignTable->item(i, 1))
-            continue;
-        SkyPoint current = skyPointAt(i);
-        bestDiff  = dms(360);
-        bestIndex = i + 1;
-        for (int j = i + 1; j < rowCount; j++)
+        SkyPoint s = start;
+        s.EquatorialToHorizontal(data->lst(), data->geo()->lat());
+        startPt.az_deg  = s.az().Degrees();
+        startPt.alt_deg = s.alt().Degrees();
+    }
+
+    // Pure nearest-neighbor sort; returns permutation of 0..pts.size()-1.
+    const std::vector<int> order =
+        mountModelNearestNeighborOrder(pts, startPt, isAltAz, lst);
+
+    // Apply permutation to the table using O(N) swaps.
+    // curSlot[i] = which slot in pts/rows currently holds original element i.
+    // atSlot[k]  = which original element is currently in slot k.
+    const int n = static_cast<int>(pts.size());
+    std::vector<int> curSlot(n), atSlot(n);
+    for (int i = 0; i < n; i++) { curSlot[i] = i; atSlot[i] = i; }
+
+    for (int k = 0; k < n; k++)
+    {
+        const int wantOrig = order[k];
+        const int cs       = curSlot[wantOrig];
+        if (cs != k)
         {
-            if (!alignTable->item(j, 0) || !alignTable->item(j, 1))
-                continue;
-            SkyPoint sp = skyPointAt(j);
-            dms diff = current.angularDistanceTo(&sp);
-            if (diff.Degrees() < bestDiff.Degrees())
-            {
-                bestIndex = j;
-                bestDiff  = diff;
-            }
+            swapAlignPoints(rows[k], rows[cs]);
+            std::swap(rows[k], rows[cs]);
+            const int displaced = atSlot[k];
+            curSlot[displaced]  = cs;
+            atSlot[cs]          = displaced;
+            curSlot[wantOrig]   = k;
+            atSlot[k]           = wantOrig;
         }
-        if (bestIndex != i + 1)
-            swapAlignPoints(bestIndex, i + 1);
     }
 }
 
@@ -518,7 +543,8 @@ void MountModel::slotSortAlignmentPoints()
     // While a run is in progress, sort only the points not yet visited so that
     // completed rows are not disturbed and currentAlignmentPoint stays valid.
     int fromRow = m_IsRunning ? currentAlignmentPoint : 0;
-    sortTableRows(fromRow, m_AlignInstance->telescopeCoordinates());
+    SkyPoint liveCoord = m_AlignInstance->telescopeCoordinates();
+    sortTableRows(fromRow, liveCoord);
     if (previewShowing)
         updatePreviewAlignPoints();
 }
