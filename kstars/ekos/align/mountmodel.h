@@ -42,11 +42,6 @@ class MountModel : public QDialog, public Ui::mountModel
             OBJECT_FIXED_GRID
         };
 
-        void setTelescopeCoord(const SkyPoint &newCoord)
-        {
-            telescopeCoord = newCoord;
-        }
-
         bool isRunning() const
         {
             return m_IsRunning;
@@ -116,8 +111,6 @@ class MountModel : public QDialog, public Ui::mountModel
         bool previewShowing { false };
         QVector<const StarObject *> alignStars;
         QUrl alignURL;
-        SkyPoint telescopeCoord;
-
         // Saved solver settings restored after model run
         bool m_solverSettingsSaved { false };
         bool m_savedUsePosition { false };
@@ -125,7 +118,6 @@ class MountModel : public QDialog, public Ui::mountModel
         int m_savedGotoMode { 2 };  // Align::GOTO_NOTHING -- safe no-op default
 
         bool m_WaitingForUnpark { false };
-
 
 };
 }

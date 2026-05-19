@@ -515,7 +515,7 @@ void MountModel::slotSortAlignmentPoints()
     // While a run is in progress, sort only the points not yet visited so that
     // completed rows are not disturbed and currentAlignmentPoint stays valid.
     int fromRow = m_IsRunning ? currentAlignmentPoint : 0;
-    sortTableRows(fromRow, telescopeCoord);
+    sortTableRows(fromRow, m_AlignInstance->telescopeCoordinates());
     if (previewShowing)
         updatePreviewAlignPoints();
 }
@@ -625,7 +625,7 @@ void MountModel::slotWizardAlignmentPoints()
                                newPoints.size(), points));
 
         // Determine start point for sorting: last existing row, or telescope if table is empty.
-        SkyPoint sortStart = telescopeCoord;
+        SkyPoint sortStart = m_AlignInstance->telescopeCoordinates();
         int lastExistingRow = alignTable->rowCount() - 1;
         if (lastExistingRow >= 0)
         {
