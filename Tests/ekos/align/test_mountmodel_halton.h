@@ -31,9 +31,6 @@ class TestMountModelHalton : public QObject
 
         void testStatefulHaltonSequence();
         void testHorizonRejection();
-
-    private:
-        static double halton(int index, int base);
 };
 
 #endif

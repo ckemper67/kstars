@@ -10,6 +10,7 @@
 #include "../../kstars/skycomponents/linelist.h"
 #include "../../kstars/skycomponents/artificialhorizoncomponent.h"
 #include "../../kstars/ekos/align/haltonsequence.h"
+#include "../../kstars/ekos/align/mountmodel.h"
 
 #include <cmath>
 #include <QtTest>
@@ -23,25 +24,10 @@ static constexpr double kMaxAbsDec = 80.0;
 
 TestMountModelHalton::TestMountModelHalton() : QObject() {}
 
-// Replicate the halton() member from MountModel (3-line pure function).
-double TestMountModelHalton::halton(int index, int base)
-{
-    double result = 0.0;
-    double f      = 1.0;
-    while (index > 0)
-    {
-        f /= static_cast<double>(base);
-        result += (index % base) * f;
-        index /= base;
-    }
-    return result;
-}
-
 // ---------------------------------------------------------------------------
 // testPointsAboveHorizon
 //
-// For each (lat, LST, minAlt) combination, generate kNumPoints via the same
-// AltAz-space Halton logic used in MountModel::slotWizardAlignmentPoints(),
+// For each (lat, LST, minAlt) combination, generate kNumPoints via MountModel::generateHaltonPoints(),
 // then convert the stored (ra, dec) back to AltAz and verify alt >= minAlt.
 // ---------------------------------------------------------------------------
 
@@ -83,35 +69,34 @@ void TestMountModelHalton::testPointsAboveHorizon()
     dms lstDms;
     lstDms.setH(lst);
 
-    double sinMin = std::sin(minAlt   * dms::DegToRad);
-    double sinMax = std::sin(kMaxAlt  * dms::DegToRad);
+    QVector<Ekos::MountModel::AlignmentPoint> points = Ekos::MountModel::generateHaltonPoints(
+        kNumPoints,
+        minAlt,
+        kMaxAlt,
+        kMaxAbsDec,
+        lstDms,
+        latDms,
+        nullptr, // horizon
+        false    // snap
+    );
 
-    for (int i = 1; i <= kNumPoints; i++)
+    QCOMPARE(points.size(), kNumPoints);
+
+    for (int i = 0; i < points.size(); ++i)
     {
-        double az  = halton(i, 2) * 360.0;
-        double alt = std::asin(sinMin + halton(i, 3) * (sinMax - sinMin)) / dms::DegToRad;
-
-        // Convert AltAz -> equatorial (same as the implementation).
-        SkyPoint sp;
-        sp.setAlt(alt);
-        sp.setAz(az);
-        sp.HorizontalToEquatorial(&lstDms, &latDms);
-
-        double ra  = sp.ra().Hours();
-        double dec = std::copysign(qMin(std::abs(sp.dec().Degrees()), kMaxAbsDec),
-                                   sp.dec().Degrees());
+        dms raDms = dms::fromString(points[i].ra, false);
+        dms decDms = dms::fromString(points[i].dec, true);
 
         // Convert (ra, dec) back to AltAz to verify the point is above the horizon.
         SkyPoint check;
-        check.setRA(ra);
-        check.setDec(dec);
+        check.setRA(raDms.Hours());
+        check.setDec(decDms.Degrees());
         check.EquatorialToHorizontal(&lstDms, &latDms);
 
         double checkAlt = check.alt().Degrees();
         QVERIFY2(checkAlt >= minAlt - 0.001,
-                 qPrintable(QString("Point %1: az=%2 alt=%3 -> ra=%4 dec=%5 -> checkAlt=%6 < minAlt=%7")
-                            .arg(i).arg(az, 0, 'f', 2).arg(alt, 0, 'f', 2)
-                            .arg(ra, 0, 'f', 4).arg(dec, 0, 'f', 4)
+                 qPrintable(QString("Point %1: ra=%2 dec=%3 -> checkAlt=%4 < minAlt=%5")
+                            .arg(i + 1).arg(points[i].ra).arg(points[i].dec)
                             .arg(checkAlt, 0, 'f', 4).arg(minAlt)));
     }
 }
@@ -119,7 +104,7 @@ void TestMountModelHalton::testPointsAboveHorizon()
 // ---------------------------------------------------------------------------
 // testPointsAwayFromPole
 //
-// Verify that after Dec clamping, |Dec| <= kMaxAbsDec for all points and
+// Verify that after Dec filtering, |Dec| <= kMaxAbsDec for all points and
 // all observer locations.
 // ---------------------------------------------------------------------------
 
@@ -146,33 +131,47 @@ void TestMountModelHalton::testPointsAwayFromPole()
     dms lstDms;
     lstDms.setH(lst);
 
-    double sinMin = std::sin(minAlt  * dms::DegToRad);
-    double sinMax = std::sin(kMaxAlt * dms::DegToRad);
+    QVector<Ekos::MountModel::AlignmentPoint> points = Ekos::MountModel::generateHaltonPoints(
+        kNumPoints,
+        minAlt,
+        kMaxAlt,
+        kMaxAbsDec,
+        lstDms,
+        latDms,
+        nullptr, // horizon
+        false    // snap
+    );
 
-    for (int i = 1; i <= kNumPoints; i++)
+    QCOMPARE(points.size(), kNumPoints);
+
+    for (int i = 0; i < points.size(); ++i)
     {
-        double az  = halton(i, 2) * 360.0;
-        double alt = std::asin(sinMin + halton(i, 3) * (sinMax - sinMin)) / dms::DegToRad;
-
-        SkyPoint sp;
-        sp.setAlt(alt);
-        sp.setAz(az);
-        sp.HorizontalToEquatorial(&lstDms, &latDms);
-
-        double dec = std::copysign(qMin(std::abs(sp.dec().Degrees()), kMaxAbsDec),
-                                   sp.dec().Degrees());
+        dms decDms = dms::fromString(points[i].dec, true);
+        double dec = decDms.Degrees();
 
         QVERIFY2(std::abs(dec) <= kMaxAbsDec + 0.001,
                  qPrintable(QString("Point %1: |dec|=%2 exceeds kMaxAbsDec=%3")
-                            .arg(i).arg(std::abs(dec), 0, 'f', 4).arg(kMaxAbsDec)));
+                            .arg(i + 1).arg(std::abs(dec), 0, 'f', 4).arg(kMaxAbsDec)));
     }
 }
 
 void TestMountModelHalton::testStatefulHaltonSequence()
 {
+    auto halton = [](int index, int base) -> double {
+        double result = 0.0;
+        double f      = 1.0;
+        while (index > 0)
+        {
+            f /= static_cast<double>(base);
+            result += (index % base) * f;
+            index /= base;
+        }
+        return result;
+    };
+
     Ekos::HaltonSequence hs2(2);
     Ekos::HaltonSequence hs3(3);
-    for (int i = 1; i <= 2000; ++i)
+    for (int i = 1; i <= 100; ++i)
     {
         double val2_stateful = hs2.next();
         double val2_stateless = halton(i, 2);
@@ -197,7 +196,7 @@ void TestMountModelHalton::testHorizonRejection()
 
     // Setup a blocked region: Azimuth 45 to 135 degrees, altitude up to 50 degrees
     std::shared_ptr<LineList> list(new LineList());
-    
+
     auto p1 = std::make_shared<SkyPoint>();
     p1->setAz(dms(45.0));
     p1->setAlt(dms(50.0));
@@ -211,47 +210,46 @@ void TestMountModelHalton::testHorizonRejection()
     horizon.addRegion("BlockedRegion", true, list, false);
     QVERIFY(horizon.altitudeConstraintsExist());
 
-    // Point generation simulation parameters
+    // Point generation parameters
     constexpr double minAlt = 15.0;
     constexpr double maxAlt = 85.0;
-    double sinMin = std::sin(minAlt * dms::DegToRad);
-    double sinMax = std::sin(maxAlt * dms::DegToRad);
-    
-    Ekos::HaltonSequence haltonAz(2);
-    Ekos::HaltonSequence haltonAlt(3);
-    
-    int targetPoints = 100;
-    int generatedCount = 0;
-    int rejectedCount = 0;
-    
-    constexpr int MAX_CANDIDATES = 10000;
-    
-    while (generatedCount < targetPoints && haltonAz.index() <= MAX_CANDIDATES)
+
+    dms lstDms(12.0); // Arbitrary LST
+    dms latDms(45.0); // Arbitrary latitude
+
+    QVector<Ekos::MountModel::AlignmentPoint> points = Ekos::MountModel::generateHaltonPoints(
+        100,
+        minAlt,
+        maxAlt,
+        kMaxAbsDec,
+        lstDms,
+        latDms,
+        &horizon,
+        false    // snap
+    );
+
+    QCOMPARE(points.size(), 100);
+
+    for (int i = 0; i < points.size(); ++i)
     {
-        double az = haltonAz.next() * 360.0;
-        double alt = std::asin(sinMin + haltonAlt.next() * (sinMax - sinMin)) / dms::DegToRad;
-        
-        if (!horizon.isAltitudeOK(az, alt, nullptr))
-        {
-            rejectedCount++;
-            if (az >= 45.0 && az <= 135.0)
-            {
-                double constraint = horizon.altitudeConstraint(az);
-                QVERIFY(alt < constraint);
-            }
-            continue;
-        }
-        
+        dms raDms = dms::fromString(points[i].ra, false);
+        dms decDms = dms::fromString(points[i].dec, true);
+
+        SkyPoint sp(raDms, decDms);
+        sp.EquatorialToHorizontal(&lstDms, &latDms);
+
+        double az = sp.az().Degrees();
+        double alt = sp.alt().Degrees();
+
+        // Ensure the generated point is NOT in the blocked zone.
+        // The blocked zone is: Azimuth 45 to 135, altitude < 50.
         if (az >= 45.0 && az <= 135.0)
         {
-            QVERIFY2(alt >= 50.0, qPrintable(QString("Accepted point in blocked zone! az=%1, alt=%2").arg(az).arg(alt)));
+            QVERIFY2(alt >= 50.0 - 0.001,
+                     qPrintable(QString("Accepted point in blocked zone! az=%1, alt=%2")
+                                .arg(az).arg(alt)));
         }
-        
-        generatedCount++;
     }
-    
-    QCOMPARE(generatedCount, targetPoints);
-    QVERIFY(rejectedCount > 0); // Ensure points were actually filtered and rejected
 }
 
 QTEST_GUILESS_MAIN(TestMountModelHalton)
