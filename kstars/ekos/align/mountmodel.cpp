@@ -17,6 +17,7 @@
 #include "skymap.h"
 #include "starobject.h"
 #include "skymapcomposite.h"
+#include "artificialhorizoncomponent.h"
 #include "skyobject.h"
 #include "starobject.h"
 #include "dialogs/finddialog.h"
@@ -30,6 +31,8 @@
 
 // Qt version calming
 #include <qtendl.h>
+
+#include "haltonsequence.h"
 
 namespace Ekos
 {
@@ -577,13 +580,27 @@ void MountModel::slotWizardAlignmentPoints()
         };
         QVector<Point> newPoints;
 
-        // Iterate through the Halton sequence until we have enough points.
-        // Use a generous upper bound to handle sparse catalogues at high latitudes.
-        const int maxCandidates = qMax(points * 10, 200);
-        for (int i = 1; i <= maxCandidates && newPoints.size() < points; i++)
+        // Retrieve active artificial horizon constraint manager if requested
+        const bool useHorizon = artificialHorizonCheck->isChecked();
+        ArtificialHorizon const *horizon = nullptr;
+        if (useHorizon && data->skyComposite() && data->skyComposite()->artificialHorizon())
         {
-            double az  = halton(i, 2) * 360.0;
-            double alt = std::asin(sinMin + halton(i, 3) * (sinMax - sinMin)) / dms::DegToRad;
+            horizon = &data->skyComposite()->artificialHorizon()->getHorizon();
+        }
+        const bool horizonActive = useHorizon && horizon && horizon->altitudeConstraintsExist();
+
+        // Iterate through the Halton sequence until we have enough points.
+        HaltonSequence haltonAz(2);
+        HaltonSequence haltonAlt(3);
+        constexpr int MAX_CANDIDATES = 50000;
+
+        while (newPoints.size() < points && haltonAz.index() <= MAX_CANDIDATES)
+        {
+            double az  = haltonAz.next() * 360.0;
+            double alt = std::asin(sinMin + haltonAlt.next() * (sinMax - sinMin)) / dms::DegToRad;
+
+            if (horizonActive && !horizon->isAltitudeOK(az, alt, nullptr))
+                continue;
 
             SkyPoint sp;
             sp.setAlt(alt);
@@ -604,9 +621,17 @@ void MountModel::slotWizardAlignmentPoints()
                     continue;
                 if (usedObjects.contains(obj))
                     continue;
-                usedObjects.insert(obj);
+
                 SkyObject *o = obj->clone();
                 o->updateCoords(data->updateNum(), true, data->geo()->lat(), data->lst(), false);
+
+                if (horizonActive && !horizon->isAltitudeOK(o->az().Degrees(), o->alt().Degrees(), nullptr))
+                {
+                    delete o;
+                    continue;
+                }
+
+                usedObjects.insert(obj);
                 getFormattedCoords(o->ra0().Hours(), o->dec0().Degrees(), ra_report, dec_report);
                 name = o->longname();
                 delete o;
@@ -849,20 +874,6 @@ void MountModel::calculateAZPointsForDEC(dms dec, dms alt, dms &AZEast, dms &AZW
     AZRad      = acos(arg);
     AZEast.setRadians(AZRad);
     AZWest.setRadians(2.0 * dms::PI - AZRad);
-}
-
-double MountModel::halton(int index, int base)
-{
-    double result = 0;
-    double f      = 1.0 / base;
-    int i         = index;
-    while (i > 0)
-    {
-        result += f * (i % base);
-        i /= base;
-        f /= base;
-    }
-    return result;
 }
 
 const SkyObject *MountModel::getWizardAlignObject(double ra, double dec)

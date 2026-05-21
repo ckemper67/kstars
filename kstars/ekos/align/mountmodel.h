@@ -85,7 +85,6 @@ class MountModel : public QDialog, public Ui::mountModel
         void updatePreviewAlignPoints();
         void sortTableRows(int fromRow, const SkyPoint &start);
         void swapAlignPoints(int firstPt, int secondPt);
-        double halton(int index, int base);
 
         void saveAndOverrideSolverSettings();
         void restoreSolverSettings();

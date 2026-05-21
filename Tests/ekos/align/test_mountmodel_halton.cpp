@@ -7,6 +7,9 @@
 #include "test_mountmodel_halton.h"
 #include "auxiliary/dms.h"
 #include "skyobjects/skypoint.h"
+#include "../../kstars/skycomponents/linelist.h"
+#include "../../kstars/skycomponents/artificialhorizoncomponent.h"
+#include "../../kstars/ekos/align/haltonsequence.h"
 
 #include <cmath>
 #include <QtTest>
@@ -163,6 +166,92 @@ void TestMountModelHalton::testPointsAwayFromPole()
                  qPrintable(QString("Point %1: |dec|=%2 exceeds kMaxAbsDec=%3")
                             .arg(i).arg(std::abs(dec), 0, 'f', 4).arg(kMaxAbsDec)));
     }
+}
+
+void TestMountModelHalton::testStatefulHaltonSequence()
+{
+    Ekos::HaltonSequence hs2(2);
+    Ekos::HaltonSequence hs3(3);
+    for (int i = 1; i <= 2000; ++i)
+    {
+        double val2_stateful = hs2.next();
+        double val2_stateless = halton(i, 2);
+        QCOMPARE(hs2.index(), i);
+        QVERIFY2(std::abs(val2_stateful - val2_stateless) < 1e-9,
+                 qPrintable(QString("Base 2 mismatch at index %1: stateful=%2, stateless=%3")
+                            .arg(i).arg(val2_stateful).arg(val2_stateless)));
+
+        double val3_stateful = hs3.next();
+        double val3_stateless = halton(i, 3);
+        QCOMPARE(hs3.index(), i);
+        QVERIFY2(std::abs(val3_stateful - val3_stateless) < 1e-9,
+                 qPrintable(QString("Base 3 mismatch at index %1: stateful=%2, stateless=%3")
+                            .arg(i).arg(val3_stateful).arg(val3_stateless)));
+    }
+}
+
+void TestMountModelHalton::testHorizonRejection()
+{
+    ArtificialHorizon horizon;
+    horizon.setTesting();
+
+    // Setup a blocked region: Azimuth 45 to 135 degrees, altitude up to 50 degrees
+    std::shared_ptr<LineList> list(new LineList());
+    
+    auto p1 = std::make_shared<SkyPoint>();
+    p1->setAz(dms(45.0));
+    p1->setAlt(dms(50.0));
+    list->append(p1);
+
+    auto p2 = std::make_shared<SkyPoint>();
+    p2->setAz(dms(135.0));
+    p2->setAlt(dms(50.0));
+    list->append(p2);
+
+    horizon.addRegion("BlockedRegion", true, list, false);
+    QVERIFY(horizon.altitudeConstraintsExist());
+
+    // Point generation simulation parameters
+    constexpr double minAlt = 15.0;
+    constexpr double maxAlt = 85.0;
+    double sinMin = std::sin(minAlt * dms::DegToRad);
+    double sinMax = std::sin(maxAlt * dms::DegToRad);
+    
+    Ekos::HaltonSequence haltonAz(2);
+    Ekos::HaltonSequence haltonAlt(3);
+    
+    int targetPoints = 100;
+    int generatedCount = 0;
+    int rejectedCount = 0;
+    
+    constexpr int MAX_CANDIDATES = 10000;
+    
+    while (generatedCount < targetPoints && haltonAz.index() <= MAX_CANDIDATES)
+    {
+        double az = haltonAz.next() * 360.0;
+        double alt = std::asin(sinMin + haltonAlt.next() * (sinMax - sinMin)) / dms::DegToRad;
+        
+        if (!horizon.isAltitudeOK(az, alt, nullptr))
+        {
+            rejectedCount++;
+            if (az >= 45.0 && az <= 135.0)
+            {
+                double constraint = horizon.altitudeConstraint(az);
+                QVERIFY(alt < constraint);
+            }
+            continue;
+        }
+        
+        if (az >= 45.0 && az <= 135.0)
+        {
+            QVERIFY2(alt >= 50.0, qPrintable(QString("Accepted point in blocked zone! az=%1, alt=%2").arg(az).arg(alt)));
+        }
+        
+        generatedCount++;
+    }
+    
+    QCOMPARE(generatedCount, targetPoints);
+    QVERIFY(rejectedCount > 0); // Ensure points were actually filtered and rejected
 }
 
 QTEST_GUILESS_MAIN(TestMountModelHalton)

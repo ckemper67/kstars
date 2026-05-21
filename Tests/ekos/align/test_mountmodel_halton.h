@@ -29,6 +29,9 @@ class TestMountModelHalton : public QObject
         void testPointsAwayFromPole_data();
         void testPointsAwayFromPole();
 
+        void testStatefulHaltonSequence();
+        void testHorizonRejection();
+
     private:
         static double halton(int index, int base);
 };
