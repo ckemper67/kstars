@@ -8,6 +8,7 @@
 */
 
 #include "gmath.h"
+#include "ekos/guide/donuts/donuts.h"
 
 #include "Options.h"
 #include "fitsviewer/fitsdata.h"
@@ -27,11 +28,88 @@
 // Qt version calming
 #include <qtendl.h>
 
+static std::vector<double> donutsToDoubleBuffer(const QSharedPointer<FITSData> &data)
+{
+    const auto   &stats = data->getStatistics();
+    const int     n     = data->width() * data->height();
+    const uint8_t *raw  = data->getImageBuffer();
+    std::vector<double> out(n);
+    switch (stats.dataType)
+    {
+        case TBYTE:
+            for (int i = 0; i < n; ++i) out[i] = raw[i];
+            break;
+        case TSHORT: {
+            const int16_t *buf = reinterpret_cast<const int16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TUSHORT: {
+            const uint16_t *buf = reinterpret_cast<const uint16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONG: {
+            const int32_t *buf = reinterpret_cast<const int32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TULONG: {
+            const uint32_t *buf = reinterpret_cast<const uint32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TFLOAT: {
+            const float *buf = reinterpret_cast<const float *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONGLONG: {
+            const int64_t *buf = reinterpret_cast<const int64_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TDOUBLE: {
+            const double *buf = reinterpret_cast<const double *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        default:
+            qCWarning(KSTARS_EKOS_GUIDE) << "DONUTS: unsupported dataType" << stats.dataType;
+            break;
+    }
+    return out;
+}
+
 GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imageData,
         QSharedPointer<GuideView> &guideView, bool firstFrame)
 {
     GuiderUtils::Vector position;
-    if (usingSEPMultiStar())
+
+    if (m_StarDetectionAlgorithm == DONUTS_REGISTRATION)
+    {
+        auto pixels = donutsToDoubleBuffer(imageData);
+        if (firstFrame || !m_DonutsRegistrar->hasReference())
+        {
+            m_DonutsRegistrar->setReference(pixels.data(), imageData->width(), imageData->height());
+            // Return image center so targetPosition is set to a valid non-zero coordinate.
+            // On subsequent frames, drift = position - targetPosition, which starts at zero.
+            return GuiderUtils::Vector(imageData->width() / 2.0, imageData->height() / 2.0, 0);
+        }
+
+        Donuts::Transform transform = m_DonutsRegistrar->measure(
+            pixels.data(), imageData->width(), imageData->height());
+        // Below SNR 3 the correlation peak is indistinguishable from noise;
+        // returning (-1,-1) lets the guider treat this as a lost star.
+        if (!transform.valid())
+            return GuiderUtils::Vector(-1, -1, -1);
+        // Synthesize a virtual star position: Target + Measured Drift.
+        // This feeds dx/dy directly into the same PID/GPG pipeline used by
+        // all other registration algorithms.
+        position.x = targetPosition.x + transform.dx;
+        position.y = targetPosition.y + transform.dy;
+    }
+    else if (usingSEPMultiStar())
     {
         QRect trackingBox = guideView->getTrackingBox();
         position = guideStars.findGuideStar(imageData, trackingBox, guideView, firstFrame);
@@ -48,7 +126,7 @@ GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imag
 }
 
 
-cgmath::cgmath() : QObject()
+cgmath::cgmath() : QObject(), m_DonutsRegistrar(std::make_unique<Donuts::Registrar>())
 {
     // sky coord. system vars.
     starPosition = GuiderUtils::Vector(0);
@@ -169,10 +247,14 @@ bool cgmath::reset()
 
 void cgmath::setStarDetectionAlgorithmIndex(int algorithmIndex)
 {
-    if (algorithmIndex < 0 || algorithmIndex > SEP_MULTISTAR)
+    if (algorithmIndex < 0 || algorithmIndex > DONUTS_REGISTRATION)
         return;
 
-    m_StarDetectionAlgorithm = algorithmIndex;
+    if (m_StarDetectionAlgorithm != algorithmIndex)
+    {
+        m_StarDetectionAlgorithm = algorithmIndex;
+        m_DonutsRegistrar->reset();
+    }
 }
 
 bool cgmath::usingSEPMultiStar() const
@@ -220,6 +302,7 @@ void cgmath::abort()
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
     m_DECHysteresisGuider->reset();
+    m_DonutsRegistrar->reset();
 }
 
 void cgmath::suspend(bool mode)
@@ -229,6 +312,7 @@ void cgmath::suspend(bool mode)
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
     m_DECHysteresisGuider->reset();
+    m_DonutsRegistrar->reset();
 }
 
 bool cgmath::isSuspended() const

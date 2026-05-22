@@ -31,6 +31,7 @@ class Edge;
 class GuideLog;
 class LinearGuider;
 class HysteresisGuider;
+namespace Donuts { class Registrar; }
 
 // For now also copied in guidealgorithms.cpp
 #define SMART_THRESHOLD    0
@@ -39,6 +40,7 @@ class HysteresisGuider;
 #define AUTO_THRESHOLD     3
 #define NO_THRESHOLD       4
 #define SEP_MULTISTAR      5
+#define DONUTS_REGISTRATION 6
 
 #define GUIDE_RA    0
 #define GUIDE_DEC   1
@@ -222,6 +224,7 @@ class cgmath : public QObject
         std::unique_ptr < LinearGuider > m_DECLinearGuider;
         std::unique_ptr < HysteresisGuider > m_RAHysteresisGuider;
         std::unique_ptr < HysteresisGuider > m_DECHysteresisGuider;
+        std::unique_ptr<Donuts::Registrar> m_DonutsRegistrar;
 
         Calibration calibration;
         bool configureInParams(Ekos::GuideState state);
