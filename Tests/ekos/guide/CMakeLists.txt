@@ -18,3 +18,12 @@ TARGET_LINK_LIBRARIES( testcalibrationprocess ${TEST_LIBRARIES})
 ADD_TEST( NAME CalibrationProcessTest COMMAND testcalibrationprocess )
 SET_TESTS_PROPERTIES( CalibrationProcessTest PROPERTIES LABELS "stable")
 
+FIND_PACKAGE(Eigen3 REQUIRED)
+ADD_EXECUTABLE( testguidealgorithms testguidealgorithms.cpp )
+TARGET_INCLUDE_DIRECTORIES( testguidealgorithms PRIVATE
+    ${CMAKE_BINARY_DIR}/kstars
+    ${EIGEN3_INCLUDE_DIR}
+)
+TARGET_LINK_LIBRARIES( testguidealgorithms ${TEST_LIBRARIES})
+ADD_TEST( NAME GuideAlgorithmsTest COMMAND testguidealgorithms )
+SET_TESTS_PROPERTIES( GuideAlgorithmsTest PROPERTIES LABELS "stable")
