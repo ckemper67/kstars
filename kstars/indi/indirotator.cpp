@@ -60,9 +60,23 @@ bool Rotator::setReversed(bool enabled)
     return true;
 }
 
+bool Rotator::guideDelta(double delta)
+{
+    auto nvp = getNumber("ROTATOR_GUIDE");
+    if (nvp)
+    {
+        nvp[0].setValue(delta);
+        sendNewProperty(nvp);
+        return true;
+    }
+
+    // Fallback: If the driver doesn't support ROTATOR_GUIDE, use absolute angle
+    return setAbsoluteAngle(m_AbsoluteAngle + delta);
+}
+
 void Rotator::registerProperty(INDI::Property prop)
 {
-    if (prop.isNameMatch("ABS_ROTATOR_ANGLE"))
+    if (prop.isNameMatch("ABS_ROTATOR_ANGLE") || prop.isNameMatch("ROTATOR_GUIDE"))
         processNumber(prop);
     else if (prop.isNameMatch("ROTATOR_REVERSE"))
         processSwitch(prop);

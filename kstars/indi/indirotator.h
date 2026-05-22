@@ -30,6 +30,7 @@ class Rotator : public ConcreteDevice
         bool setAbsoluteAngle(double angle);
         bool setAbsoluteSteps(uint32_t steps);
         bool setReversed(bool enabled);
+        bool guideDelta(double delta);
 
         bool isReversed() const
         {
