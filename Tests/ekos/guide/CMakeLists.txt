@@ -18,3 +18,8 @@ TARGET_LINK_LIBRARIES( testcalibrationprocess ${TEST_LIBRARIES})
 ADD_TEST( NAME CalibrationProcessTest COMMAND testcalibrationprocess )
 SET_TESTS_PROPERTIES( CalibrationProcessTest PROPERTIES LABELS "stable")
 
+ADD_EXECUTABLE( testdonutsregistrar testdonutsregistrar.cpp )
+TARGET_LINK_LIBRARIES( testdonutsregistrar ${TEST_LIBRARIES})
+ADD_TEST( NAME DonutsRegistrarTest COMMAND testdonutsregistrar )
+SET_TESTS_PROPERTIES( DonutsRegistrarTest PROPERTIES LABELS "stable")
+
