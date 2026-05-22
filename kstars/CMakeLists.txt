@@ -4,6 +4,7 @@ if(NOT APPLE) #This is not needed on MacOS, since the data directory and icons a
 endif(NOT APPLE)
 
 add_subdirectory( htmesh )
+add_subdirectory( ekos/guide/donuts )
 
 if (ANDROID AND CMAKE_TOOLCHAIN_FILE)
     include(${CMAKE_TOOLCHAIN_FILE})
@@ -1384,6 +1385,7 @@ IF (NOT ANDROID)
     generate_export_header(KStarsLib)
 
     target_link_libraries(KStarsLib
+        donuts
         LibKSDataHandlers
         htmesh
         Qt::Gui
