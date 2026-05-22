@@ -8,6 +8,7 @@
 */
 
 #include "gmath.h"
+#include "ekos/guide/donuts/donuts.h"
 
 #include "Options.h"
 #include "fitsviewer/fitsdata.h"
@@ -27,11 +28,90 @@
 // Qt version calming
 #include <qtendl.h>
 
+static std::vector<double> donutsToDoubleBuffer(const QSharedPointer<FITSData> &data)
+{
+    const auto   &stats = data->getStatistics();
+    const int     n     = data->width() * data->height();
+    const uint8_t *raw  = data->getImageBuffer();
+    std::vector<double> out(n);
+    switch (stats.dataType)
+    {
+        case TBYTE:
+            for (int i = 0; i < n; ++i) out[i] = raw[i];
+            break;
+        case TSHORT: {
+            const int16_t *buf = reinterpret_cast<const int16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TUSHORT: {
+            const uint16_t *buf = reinterpret_cast<const uint16_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONG: {
+            const int32_t *buf = reinterpret_cast<const int32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TULONG: {
+            const uint32_t *buf = reinterpret_cast<const uint32_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TFLOAT: {
+            const float *buf = reinterpret_cast<const float *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TLONGLONG: {
+            const int64_t *buf = reinterpret_cast<const int64_t *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        case TDOUBLE: {
+            const double *buf = reinterpret_cast<const double *>(raw);
+            for (int i = 0; i < n; ++i) out[i] = buf[i];
+            break;
+        }
+        default:
+            qCWarning(KSTARS_EKOS_GUIDE) << "DONUTS: unsupported dataType" << stats.dataType;
+            break;
+    }
+    return out;
+}
+
 GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imageData,
         QSharedPointer<GuideView> &guideView, bool firstFrame)
 {
     GuiderUtils::Vector position;
-    if (usingSEPMultiStar())
+    
+    if (m_StarDetectionAlgorithm == DONUTS_REGISTRATION)
+    {
+        if (firstFrame || !m_DonutsRegistrar->hasReference())
+        {
+            auto pixels = donutsToDoubleBuffer(imageData);
+            m_DonutsRegistrar->setReference(pixels.data(), imageData->width(), imageData->height());
+            // Return image center so targetPosition is set to a valid non-zero coordinate.
+            // On subsequent frames, drift = position - targetPosition, which starts at zero.
+            return GuiderUtils::Vector(imageData->width() / 2.0, imageData->height() / 2.0, 0);
+        }
+
+        auto pixels = donutsToDoubleBuffer(imageData);
+        Donuts::Transform transform = m_DonutsRegistrar->measure(
+            pixels.data(), imageData->width(), imageData->height());
+        // Minimum per-quadrant correlation SNR. Below 3 the peak is indistinguishable
+        // from noise and treating it as a lost star is safer than reporting a false drift.
+        if (transform.snr < 3.0)
+            return GuiderUtils::Vector(-1, -1, -1);
+        // Synthesize virtual star position: Target + Measured Drift
+        position.x = targetPosition.x + transform.dx;
+        position.y = targetPosition.y + transform.dy;
+
+        // Emit total rotation from reference in degrees
+        Q_EMIT newRotationDelta(transform.dtheta * 180.0 / M_PI);
+    }
+    else if (usingSEPMultiStar())
     {
         QRect trackingBox = guideView->getTrackingBox();
         position = guideStars.findGuideStar(imageData, trackingBox, guideView, firstFrame);
@@ -48,7 +128,7 @@ GuiderUtils::Vector cgmath::findLocalStarPosition(QSharedPointer<FITSData> &imag
 }
 
 
-cgmath::cgmath() : QObject()
+cgmath::cgmath() : QObject(), m_DonutsRegistrar(std::make_unique<Donuts::Registrar>())
 {
     // sky coord. system vars.
     starPosition = GuiderUtils::Vector(0);
@@ -169,10 +249,14 @@ bool cgmath::reset()
 
 void cgmath::setStarDetectionAlgorithmIndex(int algorithmIndex)
 {
-    if (algorithmIndex < 0 || algorithmIndex > SEP_MULTISTAR)
+    if (algorithmIndex < 0 || algorithmIndex > DONUTS_REGISTRATION)
         return;
 
-    m_StarDetectionAlgorithm = algorithmIndex;
+    if (m_StarDetectionAlgorithm != algorithmIndex)
+    {
+        m_StarDetectionAlgorithm = algorithmIndex;
+        m_DonutsRegistrar->reset();
+    }
 }
 
 bool cgmath::usingSEPMultiStar() const
@@ -216,6 +300,7 @@ void cgmath::start()
 void cgmath::abort()
 {
     guideStars.reset();
+    m_DonutsRegistrar->reset();
     m_RALinearGuider->reset();
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
@@ -225,6 +310,8 @@ void cgmath::abort()
 void cgmath::suspend(bool mode)
 {
     suspended = mode;
+    if (mode)
+        m_DonutsRegistrar->reset();
     m_RALinearGuider->reset();
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
@@ -434,7 +521,7 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
             pulse = lGuider->guide(arcsecDrift) * calibration.decPulseMillisecondsPerArcsecond();
             pulseDirection = pulse > 0 ? DEC_DEC_DIR : DEC_INC_DIR;
         }
-        pulseLength = std::min(std::abs(pulse), maxPulseMilliseconds);
+        pulseLength = std::min(fabs(pulse), maxPulseMilliseconds);
     }
     else if (hGuider != nullptr)
     {
@@ -455,7 +542,7 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
             pulse = hGuider->guide(arcsecDrift) * calibration.decPulseMillisecondsPerArcsecond();
             pulseDirection = pulse > 0 ? DEC_DEC_DIR : DEC_INC_DIR;
         }
-        pulseLength = std::min(std::abs(pulse), maxPulseMilliseconds);
+        pulseLength = std::min(fabs(pulse), maxPulseMilliseconds);
     }
     else
     {
@@ -477,7 +564,7 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
                                         calibration.decPulseMillisecondsPerArcsecond();
         const double proportionalResponse = arcsecDrift * in_params.proportional_gain[k] * arcsecPerMsPulse;
         const double integralResponse = drift_integral[k] * in_params.integral_gain[k] * arcsecPerMsPulse;
-        pulseLength = std::min(std::abs(proportionalResponse + integralResponse), maxPulseMilliseconds);
+        pulseLength = std::min(fabs(proportionalResponse + integralResponse), maxPulseMilliseconds);
 
         // calculation of correcting mount pulse
         // We do not send pulse if direction is disabled completely, or if direction in a specific axis (e.g. N or S) is disabled

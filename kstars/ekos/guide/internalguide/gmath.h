@@ -32,6 +32,8 @@ class GuideLog;
 class LinearGuider;
 class HysteresisGuider;
 
+namespace Donuts { class Registrar; }
+
 // For now also copied in guidealgorithms.cpp
 #define SMART_THRESHOLD    0
 #define SEP_THRESHOLD      1
@@ -39,6 +41,7 @@ class HysteresisGuider;
 #define AUTO_THRESHOLD     3
 #define NO_THRESHOLD       4
 #define SEP_MULTISTAR      5
+#define DONUTS_REGISTRATION   6
 
 #define GUIDE_RA    0
 #define GUIDE_DEC   1
@@ -156,6 +159,7 @@ class cgmath : public QObject
     Q_SIGNALS:
         void newAxisDelta(double delta_ra, double delta_dec);
         void newStarPosition(QVector3D, bool);
+        void newRotationDelta(double dTheta);
 
         // For Analyze.
         void guideStats(double raError, double decError, int raPulse, int decPulse,
@@ -228,4 +232,7 @@ class cgmath : public QObject
         void updateOutParams(int k, const double arcsecDrift, int pulseLength, GuideDirection pulseDirection);
         void outputGuideLog();
         void processAxis(const int k, const bool dithering, const bool darkGuiding, const Seconds &timeStep, const QString &label);
+
+    private:
+        std::unique_ptr<Donuts::Registrar> m_DonutsRegistrar;
 };

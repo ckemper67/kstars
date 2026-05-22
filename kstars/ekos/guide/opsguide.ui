@@ -629,15 +629,20 @@
             <string>SEP Multi Star (recommended)</string>
            </property>
           </item>
+          <item>
+           <property name="text">
+            <string>DONUTS</string>
+           </property>
+          </item>
          </widget>
         </item>
         <item row="0" column="0">
          <widget class="QLabel" name="l_19">
           <property name="toolTip">
-           <string>The algorithm that tracks guide stars and determines the guide deviation.</string>
+           <string>The algorithm that detects guide stars or registers frame offsets. DONUTS uses image registration (phase correlation) instead of star detection.</string>
           </property>
           <property name="text">
-           <string>Star Detection Algorithm</string>
+           <string>Star Detection / Registration Algorithm</string>
           </property>
          </widget>
         </item>
