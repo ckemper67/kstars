@@ -27,3 +27,10 @@ TARGET_INCLUDE_DIRECTORIES( testguidealgorithms PRIVATE
 TARGET_LINK_LIBRARIES( testguidealgorithms ${TEST_LIBRARIES})
 ADD_TEST( NAME GuideAlgorithmsTest COMMAND testguidealgorithms )
 SET_TESTS_PROPERTIES( GuideAlgorithmsTest PROPERTIES LABELS "stable")
+
+ADD_EXECUTABLE( benchmarkguidealgorithms benchmarkguidealgorithms.cpp )
+TARGET_INCLUDE_DIRECTORIES( benchmarkguidealgorithms PRIVATE
+    ${CMAKE_BINARY_DIR}/kstars
+    ${EIGEN3_INCLUDE_DIR}
+)
+TARGET_LINK_LIBRARIES( benchmarkguidealgorithms ${TEST_LIBRARIES})
