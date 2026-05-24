@@ -380,6 +380,132 @@
             </property>
            </widget>
           </item>
+          <item row="7" column="0">
+           <widget class="QLabel" name="MPCTrackingWeightLabel">
+            <property name="text">
+             <string>MPC Tracking Q</string>
+            </property>
+            <property name="toolTip">
+             <string>Tracking error weight (Q). Higher values make the guider correct tracking errors more aggressively.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="1">
+           <widget class="QDoubleSpinBox" name="kcfg_RAMPCTrackingWeight">
+            <property name="decimals">
+             <number>1</number>
+            </property>
+            <property name="minimum">
+             <double>1.0</double>
+            </property>
+            <property name="maximum">
+             <double>100.0</double>
+            </property>
+            <property name="singleStep">
+             <double>1.0</double>
+            </property>
+            <property name="value">
+             <double>10.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="2">
+           <widget class="QDoubleSpinBox" name="kcfg_DECMPCTrackingWeight">
+            <property name="decimals">
+             <number>1</number>
+            </property>
+            <property name="minimum">
+             <double>1.0</double>
+            </property>
+            <property name="maximum">
+             <double>100.0</double>
+            </property>
+            <property name="singleStep">
+             <double>1.0</double>
+            </property>
+            <property name="value">
+             <double>10.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="0">
+           <widget class="QLabel" name="MPCControlPenaltyLabel">
+            <property name="text">
+             <string>MPC Control Penalty R</string>
+            </property>
+            <property name="toolTip">
+             <string>Control variation penalty (R). Higher values smooth corrections to prevent high-frequency oscillations or mechanical resonances (crucial for Harmonic Drive mounts).</string>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="1">
+           <widget class="QDoubleSpinBox" name="kcfg_RAMPCControlPenalty">
+            <property name="decimals">
+             <number>2</number>
+            </property>
+            <property name="minimum">
+             <double>0.01</double>
+            </property>
+            <property name="maximum">
+             <double>10.0</double>
+            </property>
+            <property name="singleStep">
+             <double>0.05</double>
+            </property>
+            <property name="value">
+             <double>0.1</double>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="2">
+           <widget class="QDoubleSpinBox" name="kcfg_DECMPCControlPenalty">
+            <property name="decimals">
+             <number>2</number>
+            </property>
+            <property name="minimum">
+             <double>0.01</double>
+            </property>
+            <property name="maximum">
+             <double>10.0</double>
+            </property>
+            <property name="singleStep">
+             <double>0.05</double>
+            </property>
+            <property name="value">
+             <double>0.1</double>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="0">
+           <widget class="QLabel" name="MPCHarmonicProfileLabel">
+            <property name="text">
+             <string>Harmonic Drive Mount</string>
+            </property>
+            <property name="toolTip">
+             <string>Check this if your mount uses a Harmonic Drive (strain wave) gear. This adjusts the MPC settings to prevent resonance jitter and ensure ultra-smooth tracking.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="1">
+           <widget class="QCheckBox" name="kcfg_RAMPCHarmonicProfile">
+            <property name="text">
+             <string/>
+            </property>
+            <property name="toolTip">
+             <string>Apply Harmonic Drive tuning (R = 1.0) for the RA axis.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="2">
+           <widget class="QCheckBox" name="kcfg_DECMPCHarmonicProfile">
+            <property name="text">
+             <string/>
+            </property>
+            <property name="toolTip">
+             <string>Apply Harmonic Drive tuning (R = 1.0) for the DEC axis.</string>
+            </property>
+           </widget>
+          </item>
          </layout>
         </item>
        </layout>

@@ -19,6 +19,7 @@
 #include "../guideview.h"
 #include "linearguider.h"
 #include "hysteresisguider.h"
+#include "mpcguider.h"
 #include "ekos/guide/opsguide.h"
 
 #include <QVector3D>
@@ -70,6 +71,8 @@ cgmath::cgmath() : QObject()
     m_DECLinearGuider.reset(new LinearGuider("DEC"));
     m_RAHysteresisGuider.reset( new HysteresisGuider("RA"));
     m_DECHysteresisGuider.reset(new HysteresisGuider("DEC"));
+    m_RAMPCGuider.reset( new MPCGuider("RA"));
+    m_DECMPCGuider.reset(new MPCGuider("DEC"));
 }
 
 cgmath::~cgmath()
@@ -211,6 +214,8 @@ void cgmath::start()
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
     m_DECHysteresisGuider->reset();
+    m_RAMPCGuider->reset();
+    m_DECMPCGuider->reset();
 }
 
 void cgmath::abort()
@@ -220,6 +225,8 @@ void cgmath::abort()
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
     m_DECHysteresisGuider->reset();
+    m_RAMPCGuider->reset();
+    m_DECMPCGuider->reset();
 }
 
 void cgmath::suspend(bool mode)
@@ -229,6 +236,8 @@ void cgmath::suspend(bool mode)
     m_DECLinearGuider->reset();
     m_RAHysteresisGuider->reset();
     m_DECHysteresisGuider->reset();
+    m_RAMPCGuider->reset();
+    m_DECMPCGuider->reset();
 }
 
 bool cgmath::isSuspended() const
@@ -374,9 +383,12 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
         m_DECLinearGuider->reset();
         m_RAHysteresisGuider->reset();
         m_DECHysteresisGuider->reset();
+        m_RAMPCGuider->reset();
+        m_DECMPCGuider->reset();
     }
     LinearGuider *lGuider = nullptr;
     HysteresisGuider *hGuider = nullptr;
+    MPCGuider *mGuider = nullptr;
     bool useGPG = false;
     if (!dithering)
     {
@@ -391,6 +403,10 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
         else if ((Options::rAGuidePulseAlgorithm() == Ekos::OpsGuide::GPG_ALGORITHM) && (k == GUIDE_RA)
                  && in_params.enabled[k])
             useGPG = true;
+        else if ((Options::rAGuidePulseAlgorithm() == Ekos::OpsGuide::MPC_ALGORITHM) && k == GUIDE_RA)
+            mGuider = m_RAMPCGuider.get();
+        else if ((Options::dECGuidePulseAlgorithm() == Ekos::OpsGuide::MPC_ALGORITHM) && k == GUIDE_DEC)
+            mGuider = m_DECMPCGuider.get();
     }
 
     if (useGPG && darkGuide)
@@ -453,6 +469,25 @@ void cgmath::processAxis(const int k, const bool dithering, const bool darkGuide
             hGuider->setMinMove(Options::dECMinimumPulseArcSec());
             hGuider->setHysteresis(Options::dECHysteresis());
             pulse = hGuider->guide(arcsecDrift) * calibration.decPulseMillisecondsPerArcsecond();
+            pulseDirection = pulse > 0 ? DEC_DEC_DIR : DEC_INC_DIR;
+        }
+        pulseLength = std::min(std::abs(pulse), maxPulseMilliseconds);
+    }
+    else if (mGuider != nullptr)
+    {
+        double pulse = 0;
+        if (k == GUIDE_RA)
+        {
+            mGuider->setParameters(Options::rAMPCTrackingWeight(), Options::rAMPCControlPenalty());
+            mGuider->setMinMove(Options::rAMinimumPulseArcSec());
+            pulse = mGuider->guide(arcsecDrift) * calibration.raPulseMillisecondsPerArcsecond();
+            pulseDirection = pulse > 0 ? RA_DEC_DIR : RA_INC_DIR;
+        }
+        else
+        {
+            mGuider->setParameters(Options::dECMPCTrackingWeight(), Options::dECMPCControlPenalty());
+            mGuider->setMinMove(Options::dECMinimumPulseArcSec());
+            pulse = mGuider->guide(arcsecDrift) * calibration.decPulseMillisecondsPerArcsecond();
             pulseDirection = pulse > 0 ? DEC_DEC_DIR : DEC_INC_DIR;
         }
         pulseLength = std::min(std::abs(pulse), maxPulseMilliseconds);

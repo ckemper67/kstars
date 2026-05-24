@@ -11,6 +11,7 @@
 
 #include "ekos/guide/internalguide/linearguider.h"
 #include "ekos/guide/internalguide/hysteresisguider.h"
+#include "ekos/guide/internalguide/mpcguider.h"
 #include "ekos/guide/internalguide/MPI_IS_gaussian_process/src/gaussian_process_guider.h"
 
 #include <QCoreApplication>
@@ -308,6 +309,11 @@ static void runScenario(const char *title,
         auto r = runCLGPG("GPG", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
         printRow(r);
     }
+    {
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+        printRow(r);
+    }
 }
 
 // H5: step disturbance scenario.
@@ -365,6 +371,12 @@ static void runH5Scenario(const char *title,
                           noiseSigma, SEED, steps, true);
         printH5Row(r);
     }
+    {
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, 0.0, pe,
+                       noiseSigma, SEED, steps, true);
+        printH5Row(r);
+    }
 }
 
 static void runHarmonicScenario(const char *title,
@@ -395,6 +407,12 @@ static void runHarmonicScenario(const char *title,
         gpg.SetLearningRate(1.0);
         auto r = runCLGPG("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe,
                           noiseSigma, SEED, steps);
+        printRow(r, showDetrend);
+    }
+    {
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe,
+                       noiseSigma, SEED, steps);
         printRow(r, showDetrend);
     }
 }

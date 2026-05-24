@@ -41,6 +41,13 @@ OpsGuide::OpsGuide() : QFrame(KStars::Instance())
         kcfg_RAGuidePulseAlgorithm->setCurrentIndex(static_cast<int>(GPG_ALGORITHM));
     }
 
+    // Connect comboboxes for algorithm changes
+    connect(kcfg_RAGuidePulseAlgorithm, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &OpsGuide::setRAGuidePulseAlg);
+    connect(kcfg_DECGuidePulseAlgorithm, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &OpsGuide::setDECGuidePulseAlg);
+
+    // Connect Harmonic Profile checkboxes
+    connect(kcfg_RAMPCHarmonicProfile, &QCheckBox::toggled, this, &OpsGuide::slotRAMPCHarmonicToggled);
+    connect(kcfg_DECMPCHarmonicProfile, &QCheckBox::toggled, this, &OpsGuide::slotDECMPCHarmonicToggled);
 
     connect(editGuideProfile, &QAbstractButton::clicked, this, [this]()
     {
@@ -58,33 +65,59 @@ OpsGuide::OpsGuide() : QFrame(KStars::Instance())
 
     loadOptionsProfiles();
 
+    // Initialize UI states based on active algorithms and profiles
+    setRAGuidePulseAlg(kcfg_RAGuidePulseAlgorithm->currentIndex());
+    setDECGuidePulseAlg(kcfg_DECGuidePulseAlgorithm->currentIndex());
+    slotRAMPCHarmonicToggled(kcfg_RAMPCHarmonicProfile->isChecked());
+    slotDECMPCHarmonicToggled(kcfg_DECMPCHarmonicProfile->isChecked());
+
     connect(m_ConfigDialog, &KConfigDialog::settingsChanged, this, &OpsGuide::settingsUpdated);
 }
 
 void OpsGuide::setRAGuidePulseAlg(int index)
 {
-
     switch (index)
     {
         case STANDARD_ALGORITHM:
             kcfg_RAHysteresis->setDisabled(true);
             kcfg_RAIntegralGain->setDisabled(false);
+            kcfg_RAProportionalGain->setEnabled(true);
+            kcfg_RAMPCTrackingWeight->setDisabled(true);
+            kcfg_RAMPCControlPenalty->setDisabled(true);
+            kcfg_RAMPCHarmonicProfile->setDisabled(true);
             break;
         case HYSTERESIS_ALGORITHM:
             kcfg_RAHysteresis->setDisabled(false);
             kcfg_RAIntegralGain->setDisabled(true);
+            kcfg_RAProportionalGain->setEnabled(true);
+            kcfg_RAMPCTrackingWeight->setDisabled(true);
+            kcfg_RAMPCControlPenalty->setDisabled(true);
+            kcfg_RAMPCHarmonicProfile->setDisabled(true);
             break;
         case LINEAR_ALGORITHM:
-            kcfg_RAHysteresis->setDisabled(true);
-            kcfg_RAIntegralGain->setDisabled(true);
-            break;
         case GPG_ALGORITHM:
             kcfg_RAHysteresis->setDisabled(true);
             kcfg_RAIntegralGain->setDisabled(true);
+            kcfg_RAProportionalGain->setEnabled(true);
+            kcfg_RAMPCTrackingWeight->setDisabled(true);
+            kcfg_RAMPCControlPenalty->setDisabled(true);
+            kcfg_RAMPCHarmonicProfile->setDisabled(true);
+            break;
+        case MPC_ALGORITHM:
+            kcfg_RAHysteresis->setDisabled(true);
+            kcfg_RAIntegralGain->setDisabled(true);
+            kcfg_RAProportionalGain->setDisabled(true);
+            kcfg_RAMPCTrackingWeight->setEnabled(!kcfg_RAMPCHarmonicProfile->isChecked());
+            kcfg_RAMPCControlPenalty->setEnabled(!kcfg_RAMPCHarmonicProfile->isChecked());
+            kcfg_RAMPCHarmonicProfile->setEnabled(true);
             break;
         default:
             kcfg_RAHysteresis->setDisabled(false);
             kcfg_RAIntegralGain->setDisabled(false);
+            kcfg_RAProportionalGain->setEnabled(true);
+            kcfg_RAMPCTrackingWeight->setDisabled(true);
+            kcfg_RAMPCControlPenalty->setDisabled(true);
+            kcfg_RAMPCHarmonicProfile->setDisabled(true);
             break;
     }
 }
@@ -96,20 +129,70 @@ void OpsGuide::setDECGuidePulseAlg(int index)
         case STANDARD_ALGORITHM:
             kcfg_DECHysteresis->setDisabled(true);
             kcfg_DECIntegralGain->setDisabled(false);
+            kcfg_DECProportionalGain->setEnabled(true);
+            kcfg_DECMPCTrackingWeight->setDisabled(true);
+            kcfg_DECMPCControlPenalty->setDisabled(true);
+            kcfg_DECMPCHarmonicProfile->setDisabled(true);
             break;
         case HYSTERESIS_ALGORITHM:
             kcfg_DECHysteresis->setDisabled(false);
             kcfg_DECIntegralGain->setDisabled(true);
+            kcfg_DECProportionalGain->setEnabled(true);
+            kcfg_DECMPCTrackingWeight->setDisabled(true);
+            kcfg_DECMPCControlPenalty->setDisabled(true);
+            kcfg_DECMPCHarmonicProfile->setDisabled(true);
             break;
         case LINEAR_ALGORITHM:
             kcfg_DECHysteresis->setDisabled(true);
             kcfg_DECIntegralGain->setDisabled(true);
+            kcfg_DECProportionalGain->setEnabled(true);
+            kcfg_DECMPCTrackingWeight->setDisabled(true);
+            kcfg_DECMPCControlPenalty->setDisabled(true);
+            kcfg_DECMPCHarmonicProfile->setDisabled(true);
+            break;
+        case MPC_ALGORITHM:
+            kcfg_DECHysteresis->setDisabled(true);
+            kcfg_DECIntegralGain->setDisabled(true);
+            kcfg_DECProportionalGain->setDisabled(true);
+            kcfg_DECMPCTrackingWeight->setEnabled(!kcfg_DECMPCHarmonicProfile->isChecked());
+            kcfg_DECMPCControlPenalty->setEnabled(!kcfg_DECMPCHarmonicProfile->isChecked());
+            kcfg_DECMPCHarmonicProfile->setEnabled(true);
             break;
         default:
             kcfg_DECHysteresis->setDisabled(false);
             kcfg_DECIntegralGain->setDisabled(false);
+            kcfg_DECProportionalGain->setEnabled(true);
+            kcfg_DECMPCTrackingWeight->setDisabled(true);
+            kcfg_DECMPCControlPenalty->setDisabled(true);
+            kcfg_DECMPCHarmonicProfile->setDisabled(true);
             break;
     }
+}
+
+void OpsGuide::slotRAMPCHarmonicToggled(bool checked)
+{
+    if (checked)
+    {
+        kcfg_RAMPCTrackingWeight->setValue(10.0);
+        kcfg_RAMPCControlPenalty->setValue(1.0);
+    }
+    // Enable/disable spinboxes based on checkbox state and algorithm
+    bool isMPC = (kcfg_RAGuidePulseAlgorithm->currentIndex() == MPC_ALGORITHM);
+    kcfg_RAMPCTrackingWeight->setEnabled(isMPC && !checked);
+    kcfg_RAMPCControlPenalty->setEnabled(isMPC && !checked);
+}
+
+void OpsGuide::slotDECMPCHarmonicToggled(bool checked)
+{
+    if (checked)
+    {
+        kcfg_DECMPCTrackingWeight->setValue(10.0);
+        kcfg_DECMPCControlPenalty->setValue(1.0);
+    }
+    // Enable/disable spinboxes based on checkbox state and algorithm
+    bool isMPC = (kcfg_DECGuidePulseAlgorithm->currentIndex() == MPC_ALGORITHM);
+    kcfg_DECMPCTrackingWeight->setEnabled(isMPC && !checked);
+    kcfg_DECMPCControlPenalty->setEnabled(isMPC && !checked);
 }
 
 void OpsGuide::loadOptionsProfiles()

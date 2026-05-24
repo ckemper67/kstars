@@ -3350,6 +3350,30 @@
          <label>If > 0, use the hysteresis guider for DEC internal guiding with that value.</label>
          <default>0</default>
       </entry>      
+      <entry name="RAMPCTrackingWeight" type="Double">
+         <label>MPC RA Tracking Weight (Q)</label>
+         <default>10.0</default>
+      </entry>
+      <entry name="DECMPCTrackingWeight" type="Double">
+         <label>MPC DEC Tracking Weight (Q)</label>
+         <default>10.0</default>
+      </entry>
+      <entry name="RAMPCControlPenalty" type="Double">
+         <label>MPC RA Control Penalty (R)</label>
+         <default>0.1</default>
+      </entry>
+      <entry name="DECMPCControlPenalty" type="Double">
+         <label>MPC DEC Control Penalty (R)</label>
+         <default>0.1</default>
+      </entry>
+      <entry name="RAMPCHarmonicProfile" type="Bool">
+         <label>Optimize RA MPC parameters for Harmonic Drive mounts</label>
+         <default>false</default>
+      </entry>
+      <entry name="DECMPCHarmonicProfile" type="Bool">
+         <label>Optimize DEC MPC parameters for Harmonic Drive mounts</label>
+         <default>false</default>
+      </entry>
    </group>
    <group name="Scheduler">
     <entry name="SchedulerAlgorithm" type="UInt">

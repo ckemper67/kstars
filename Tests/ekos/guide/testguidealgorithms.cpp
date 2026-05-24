@@ -7,6 +7,7 @@
 #include "testguidealgorithms.h"
 #include "ekos/guide/internalguide/linearguider.h"
 #include "ekos/guide/internalguide/hysteresisguider.h"
+#include "ekos/guide/internalguide/mpcguider.h"
 #include "ekos/guide/internalguide/MPI_IS_gaussian_process/src/gaussian_process_guider.h"
 
 #include <QTest>
@@ -512,6 +513,42 @@ void TestGuideAlgorithms::testGPGSeeingNoise()
     QVERIFY(rms < sigma * 10.0);
     // And should not diverge (residual bounded to something reasonable).
     QVERIFY(std::abs(position) < sigma * 20.0);
+}
+
+void TestGuideAlgorithms::testMPCGuiderConstantDrift()
+{
+    MPCGuider g("RA");
+    g.setParameters(10.0, 0.1);
+    g.setMinMove(0.1);
+
+    auto r = runClosedLoop(g, 60, 0.5, 0.0, 0.0, 0.05, 42);
+
+    qDebug() << "MPCGuider drift  openRMS=" << r.openLoopRMS
+             << "allRMS=" << r.allRMS << "finalRMS=" << r.finalRMS;
+
+    // Open-loop RMS should grow with drift
+    QVERIFY(r.openLoopRMS > 5.0);
+    // Closed-loop residual should be substantially smaller than open-loop
+    QVERIFY(r.finalRMS < r.openLoopRMS * 0.20);
+}
+
+void TestGuideAlgorithms::testMPCGuiderPE()
+{
+    MPCGuider g("RA");
+    g.setParameters(10.0, 0.1);
+    g.setMinMove(0.1);
+
+    const int frames        = 150; // 3 periods at 50 frames/period
+    const double amplitude  = 1.5; // arcsec
+    const double period     = 50;  // frames
+
+    auto r = runClosedLoop(g, frames, 0.0, amplitude, period, 0.05, 42);
+
+    qDebug() << "MPCGuider PE  openRMS=" << r.openLoopRMS
+             << "finalRMS=" << r.finalRMS;
+
+    // Must remain bounded and stable
+    QVERIFY(r.finalRMS < amplitude * 2.0);
 }
 
 QTEST_GUILESS_MAIN(TestGuideAlgorithms)

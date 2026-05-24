@@ -1,0 +1,67 @@
+/*
+    SPDX-FileCopyrightText: 2026 Christian Kemper <ckemper@gmail.com>
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+*/
+
+#pragma once
+
+#include <QDateTime>
+#include <QString>
+#include <memory>
+
+class MPCSolver;
+class TelescopePlant;
+class LaguerreNetwork;
+
+class MPCGuider
+{
+    public:
+        MPCGuider(const QString &id);
+        ~MPCGuider();
+
+        void setParameters(double Q, double R, double J = 1e-6, double Bf = 1.0, double Kt = 1.0, int N = 10, double alpha = 0.5);
+        void setMinMove(double minMove) { m_MinMove = minMove; }
+
+        // Time is implicitly computed. Returns correction in arcseconds.
+        double guide(double offset);
+
+        void reset();
+
+        bool isHarmonicDetected() const { return m_IsHarmonicDetected; }
+
+    private:
+        QString m_ID;
+        double m_MinMove { 0.0 };
+
+        // Controller / Plant parameters
+        double m_Q { 10.0 };
+        double m_R { 0.1 };
+        double m_J { 1e-6 };
+        double m_Bf { 1.0 };
+        double m_Kt { 1.0 };
+        int m_N { 10 };
+        double m_alpha { 0.5 };
+
+        std::unique_ptr<TelescopePlant> m_Plant;
+        std::unique_ptr<LaguerreNetwork> m_Network;
+        std::unique_ptr<MPCSolver> m_Solver;
+
+        bool m_Initialized { false };
+        double m_LastDt { 0.0 };
+
+        // State reconstruction history
+        double m_PrevOffset { 0.0 };
+        double m_PrevVelocity { 0.0 };
+        bool m_HasPrevOffset { false };
+        bool m_HasPrevVelocity { false };
+
+        // Harmonic drive auto-detection passive learning
+        std::vector<double> m_OffsetHistory;
+        std::vector<double> m_VelocityHistory;
+        bool m_IsHarmonicDetected { false };
+        int m_HarmonicDetectionCounter { 0 };
+
+        QDateTime m_LastGuideTime;
+        int m_GuiderIteration { 0 };
+};

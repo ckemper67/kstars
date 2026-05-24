@@ -35,4 +35,8 @@ private slots:
     void testGPGPeriodDetection();
     void testGPGMultiHarmonic();
     void testGPGSeeingNoise();
+
+    // MPCGuider
+    void testMPCGuiderConstantDrift();
+    void testMPCGuiderPE();
 };
