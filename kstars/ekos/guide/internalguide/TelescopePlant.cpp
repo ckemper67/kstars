@@ -79,16 +79,25 @@ void TelescopePlant::discretize() {
         Cd6_(2) = 1.0;
         Cd6_(4) = (omega2_ > 0.0) ? 1.0 : 0.0;
 
-        // IMP mode uses a 6-state augmented system directly.
-        // The output y = Cd6 * x = motor_pos + d1 + d2 is penalized via the
-        // output-tracking cost in MPCSolver (Q_matrix = Q * Cd^T * Cd).
-        // Using Cd6 * x as output avoids the double-counting bug that arises
-        // when a 7th integrator-of-y row mixes absolute harmonic values with
-        // incremental B inputs.
-        system_order_ = 6;
-        Aaug_ = Ad6_;
-        Baug_ = Bd6_;
-        Caug_ = Cd6_;
+        // IMP mode uses a 7-state incremental system.
+        Aaug_ = Eigen::MatrixXd::Zero(7, 7);
+        Aaug_.block<6,6>(0,0) = Ad6_;
+        
+        // Update Tracking Position: y(k+1) = y(k) + Cd6 * Ad6 * \Delta x
+        Eigen::RowVectorXd Cd6_Ad6 = Cd6_ * Ad6_;
+        Aaug_.block<1,6>(6,0) = Cd6_Ad6;
+        Aaug_(6, 0) = 0.0; // Clear motor position coupling to prevent prediction double-counting
+        Aaug_(6, 1) = 0.0; // Clear motor velocity coupling to prevent prediction double-counting
+        Aaug_(6,6) = 1.0;
+
+        Baug_ = Eigen::VectorXd::Zero(7);
+        Baug_.segment<6>(0) = Bd6_;
+        Baug_(6) = Cd6_.dot(Bd6_);
+
+        Caug_ = Eigen::RowVectorXd::Zero(7);
+        Caug_(6) = 1.0;
+
+        system_order_ = 7;
     } else if (Ks_ > 1e7 || J_axis_ < 1e-6) {
         // --- RIGID MODE (3-state MPC) ---
         system_order_ = 3;

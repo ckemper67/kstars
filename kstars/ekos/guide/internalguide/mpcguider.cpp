@@ -217,15 +217,15 @@ double MPCGuider::guide(double offset)
         m_Initialized = true;
 
         int nx = m_Plant->getOrder();
-        if (nx == 6)
+        if (nx == 7)
         {
             const Eigen::RowVectorXd& kx = m_Solver->getKx();
-            qDebug() << QString("[MPCGuider %1] IMP Kx=[%2 %3 %4 %5 %6 %7] Kr=%8 omega1=%9 oldU=%10")
+            qDebug() << QString("[MPCGuider %1] IMP Kx=[%2 %3 %4 %5 %6 %7 %8] Kr=%9 omega1=%10 oldU=%11")
                         .arg(m_ID).arg(kx(0),6,'f',4).arg(kx(1),6,'f',4).arg(kx(2),6,'f',4)
-                        .arg(kx(3),6,'f',4).arg(kx(4),6,'f',4).arg(kx(5),6,'f',4)
+                        .arg(kx(3),6,'f',4).arg(kx(4),6,'f',4).arg(kx(5),6,'f',4).arg(kx(6),6,'f',4)
                         .arg(m_Solver->getKr(),6,'f',4).arg(m_Omega1,6,'f',4).arg(oldU,6,'f',3);
         }
-        if (nx == 6 && m_Xhat.size() != 6)
+        if (nx == 7 && m_Xhat.size() != 6)
         {
             // Fresh transition into IMP mode.
             // theta_motor = oldU; d1 = offset - oldU (zero initial observer error).
@@ -235,7 +235,7 @@ double MPCGuider::guide(double offset)
             m_Xhat(0) = oldU;
             m_Xhat(2) = offset - oldU;
             m_Xhat(3) = velocity;
-            m_XhatPred = m_Plant->getAaug() * m_Xhat;
+            m_XhatPred = m_Plant->getAd6() * m_Xhat;
         }
     }
 
@@ -244,24 +244,42 @@ double MPCGuider::guide(double offset)
     Eigen::VectorXd x_aug;
     int nx = m_Plant->getOrder();
 
-    if (nx == 6)
+    if (nx == 7)
     {
         // --- Luenberger Observer Update ---
-        const Eigen::RowVectorXd& Cd = m_Plant->getCaug();
+        const Eigen::RowVectorXd& Cd = m_Plant->getCd6();
 
         double est_y = Cd.dot(m_XhatPred);
         double err = offset - est_y;
 
         Eigen::VectorXd L = Eigen::VectorXd::Zero(6);
-        L(0) = 0.02;                                                  // motor position
+        L(0) = 0.02;                                                  // motor position (extremely slow to prevent PE absorption)
         L(1) = 0.002 / dt;                                            // motor velocity
-        L(2) = 0.30;                                                  // 1st harmonic displacement
-        L(3) = 0.30 * m_Omega1;                                       // 1st harmonic velocity
-        L(4) = (m_Omega2 > 0.0) ? 0.20 : 0.0;                        // 2nd harmonic displacement
-        L(5) = (m_Omega2 > 0.0) ? 0.20 * m_Omega2 : 0.0;             // 2nd harmonic velocity
+        L(2) = 0.60;                                                  // 1st harmonic displacement
+        L(3) = 0.60 * m_Omega1;                                       // 1st harmonic velocity
+        L(4) = 0.30;                                                  // 2nd harmonic displacement
+        L(5) = 0.30 * m_Omega2;                                       // 2nd harmonic velocity
 
         m_Xhat = m_XhatPred + L * err;
-        x_aug = m_Xhat;
+
+        // incremental state update
+        Eigen::VectorXd delta_xhat;
+        if (m_XhatPrev.size() != 6)
+        {
+            m_XhatPrev = m_Xhat;
+            delta_xhat = Eigen::VectorXd::Zero(6);
+        }
+        else
+        {
+            delta_xhat = m_Xhat - m_XhatPrev;
+            m_XhatPrev = m_Xhat;
+        }
+
+        x_aug = Eigen::VectorXd::Zero(7);
+        x_aug.segment<6>(0) = delta_xhat;
+        x_aug(0) = 0.0; // Clear motor position increment to break the unstable observer-controller loop
+        x_aug(1) = 0.0; // Clear the noisy velocity state increment to ensure high-frequency stability
+        x_aug(6) = offset;
     }
     else if (nx == 5)
     {
@@ -280,10 +298,10 @@ double MPCGuider::guide(double offset)
     double guideVal = -(current_u - prev_u);
 
     // Predict next state for the observer
-    if (nx == 6)
+    if (nx == 7)
     {
         double delta_u = current_u - prev_u;
-        m_XhatPred = m_Plant->getAaug() * m_Xhat + m_Plant->getBaug() * delta_u;
+        m_XhatPred = m_Plant->getAd6() * m_Xhat + m_Plant->getBd6() * delta_u;
     }
 
     // Apply minMove threshold

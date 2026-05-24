@@ -40,6 +40,8 @@ void MPCSolver::rebuildMatrices(const TelescopePlant& plant, const LaguerreNetwo
     Eigen::MatrixXd Q_matrix = Eigen::MatrixXd::Zero(nx, nx);
     if (nx == 3) {
         Q_matrix(2, 2) = Q_;
+    } else if (nx == 7) {
+        Q_matrix(6, 6) = Q_; // Weight the 7th state (tracking error)
     } else if (nx == 6) {
         // Output-tracking: penalize y = Caug * x
         const Eigen::RowVectorXd& Cd = plant.getCaug();

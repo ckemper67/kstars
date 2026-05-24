@@ -62,6 +62,7 @@ class MPCGuider
         // Luenberger Observer vectors
         Eigen::VectorXd m_Xhat;
         Eigen::VectorXd m_XhatPred;
+        Eigen::VectorXd m_XhatPrev;
 
         bool m_Initialized { false };
         double m_LastDt { 0.0 };
