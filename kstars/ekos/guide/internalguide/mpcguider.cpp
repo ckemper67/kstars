@@ -37,6 +37,18 @@ void MPCGuider::reset()
     m_IsHarmonicDetected = false;
     m_HarmonicDetectionCounter = 0;
 
+    m_Omega1 = 0.0;
+    m_Omega2 = 0.0;
+    m_LearnedT1 = 0.0;
+    m_LearnedT2 = 0.0;
+    m_PeriodsLearned = false;
+    if (m_FFTEstimator) {
+        m_FFTEstimator->reset();
+    }
+    m_Xhat = Eigen::VectorXd();
+    m_XhatPred = Eigen::VectorXd();
+    m_LastActiveR = -1.0;
+
     m_Solver.reset();
     m_Plant.reset();
     m_Network.reset();
@@ -128,34 +140,151 @@ double MPCGuider::guide(double offset)
         }
     }
 
-    double activeR = m_IsHarmonicDetected ? std::max(m_R, 1.0) : m_R;
-    static double lastActiveR = -1.0;
-    if (activeR != lastActiveR)
+    double activeR = m_R;
+    if (activeR != m_LastActiveR)
     {
         m_Initialized = false; // Force dynamic rebuild with the new active R
-        lastActiveR = activeR;
+        m_LastActiveR = activeR;
     }
 
-    // Dynamic rebuild of MPC matrices if dt, parameters or active R changed
+    // Active learning frequency estimator update
+    if (!m_FFTEstimator)
+    {
+        m_FFTEstimator = std::make_unique<FFTPeriodEstimator>();
+    }
+    double u_cum = m_Solver ? m_Solver->getCurrentU() : 0.0;
+    double openLoopError = offset - u_cum;
+    double elapsedSec = m_GuiderIteration * dt;
+    m_FFTEstimator->addDataPoint(elapsedSec, openLoopError);
+
+    if (m_GuiderIteration >= 40 && m_GuiderIteration % 10 == 0)
+    {
+        double t1 = 0.0, t2 = 0.0;
+        // Gate: require totalTime > 200s before trusting FFT output.
+        // This prevents spurious period detection on short pure-drift runs.
+        bool ok = m_FFTEstimator->estimatePeriods(100.0, t1, t2);
+        qDebug() << "estimatePeriods returned" << ok << "t1=" << t1 << "t2=" << t2;
+        if (ok)
+        {
+            double alpha_freq = 0.1;
+            if (m_LearnedT1 < 1.0)
+            {
+                m_LearnedT1 = t1;
+                if (t2 > 1.0) m_LearnedT2 = t2;
+            }
+            else
+            {
+                m_LearnedT1 = alpha_freq * t1 + (1.0 - alpha_freq) * m_LearnedT1;
+                if (t2 > 1.0) m_LearnedT2 = alpha_freq * t2 + (1.0 - alpha_freq) * m_LearnedT2;
+            }
+
+            double new_omega1 = 2.0 * M_PI / m_LearnedT1;
+            double new_omega2 = (m_LearnedT2 > 1.0) ? 2.0 * M_PI / m_LearnedT2 : 0.0;
+
+            bool shouldRebuild = (m_Omega1 < 1e-6)
+                               || (std::abs(new_omega1 - m_Omega1) > 0.02 * m_Omega1)
+                               || (new_omega2 > 1e-6 && m_Omega2 < 1e-6)
+                               || (new_omega2 < 1e-6 && m_Omega2 > 1e-6)
+                               || (new_omega2 > 1e-6 && std::abs(new_omega2 - m_Omega2) > 0.02 * m_Omega2);
+            if (shouldRebuild)
+            {
+                m_Omega1 = new_omega1;
+                m_Omega2 = new_omega2;
+                m_PeriodsLearned = true;
+                m_Initialized = false; // Force dynamic rebuild with new frequencies
+                qCDebug(KSTARS_EKOS_GUIDE) << QString("[MPCGuider %1] Active Learning: Learned dominant periods T1=%2s, T2=%3s. Rebuilding solver.")
+                                           .arg(m_ID).arg(m_LearnedT1, 0, 'f', 1).arg(m_LearnedT2, 0, 'f', 1);
+            }
+        }
+    }
+
+    // Dynamic rebuild of MPC matrices if dt, parameters, active R or frequencies changed
     if (!m_Initialized || std::abs(dt - m_LastDt) > 0.05 * m_LastDt)
     {
+        double oldU = m_Solver ? m_Solver->getCurrentU() : 0.0;
         m_Kt = m_Bf / dt; // Enforce unit step gain for pure integrator plant in guiding
         m_Plant = std::make_unique<TelescopePlant>(m_J, m_Bf, m_Kt, dt);
+        
+        if (m_PeriodsLearned && m_Omega1 > 0.0)
+        {
+            m_Plant->setDisturbanceFrequencies(m_Omega1, m_Omega2);
+        }
+
         m_Network = std::make_unique<LaguerreNetwork>(m_N, m_alpha);
         m_Solver = std::make_unique<MPCSolver>(*m_Plant, *m_Network, m_Q, activeR);
+        m_Solver->setCurrentU(oldU);
         m_LastDt = dt;
         m_Initialized = true;
+
+        int nx = m_Plant->getOrder();
+        if (nx == 6)
+        {
+            const Eigen::RowVectorXd& kx = m_Solver->getKx();
+            qDebug() << QString("[MPCGuider %1] IMP Kx=[%2 %3 %4 %5 %6 %7] Kr=%8 omega1=%9 oldU=%10")
+                        .arg(m_ID).arg(kx(0),6,'f',4).arg(kx(1),6,'f',4).arg(kx(2),6,'f',4)
+                        .arg(kx(3),6,'f',4).arg(kx(4),6,'f',4).arg(kx(5),6,'f',4)
+                        .arg(m_Solver->getKr(),6,'f',4).arg(m_Omega1,6,'f',4).arg(oldU,6,'f',3);
+        }
+        if (nx == 6 && m_Xhat.size() != 6)
+        {
+            // Fresh transition into IMP mode.
+            // theta_motor = oldU; d1 = offset - oldU (zero initial observer error).
+            // d1_dot seeded from velocity so the Kx[3] velocity feedforward is
+            // correct on the first IMP frame instead of starting cold at zero.
+            m_Xhat = Eigen::VectorXd::Zero(6);
+            m_Xhat(0) = oldU;
+            m_Xhat(2) = offset - oldU;
+            m_Xhat(3) = velocity;
+            m_XhatPred = m_Plant->getAaug() * m_Xhat;
+        }
     }
 
     m_GuiderIteration++;
 
-    Eigen::VectorXd x_aug = Eigen::VectorXd::Zero(3);
-    x_aug << 0.0, 0.0, offset;
+    Eigen::VectorXd x_aug;
+    int nx = m_Plant->getOrder();
+
+    if (nx == 6)
+    {
+        // --- Luenberger Observer Update ---
+        const Eigen::RowVectorXd& Cd = m_Plant->getCaug();
+
+        double est_y = Cd.dot(m_XhatPred);
+        double err = offset - est_y;
+
+        Eigen::VectorXd L = Eigen::VectorXd::Zero(6);
+        L(0) = 0.02;                                                  // motor position
+        L(1) = 0.002 / dt;                                            // motor velocity
+        L(2) = 0.30;                                                  // 1st harmonic displacement
+        L(3) = 0.30 * m_Omega1;                                       // 1st harmonic velocity
+        L(4) = (m_Omega2 > 0.0) ? 0.20 : 0.0;                        // 2nd harmonic displacement
+        L(5) = (m_Omega2 > 0.0) ? 0.20 * m_Omega2 : 0.0;             // 2nd harmonic velocity
+
+        m_Xhat = m_XhatPred + L * err;
+        x_aug = m_Xhat;
+    }
+    else if (nx == 5)
+    {
+        x_aug = Eigen::VectorXd::Zero(5);
+        x_aug << 0.0, 0.0, 0.0, 0.0, offset;
+    }
+    else
+    {
+        x_aug = Eigen::VectorXd::Zero(3);
+        x_aug << 0.0, 0.0, offset;
+    }
 
     // Setpoint is 0.0 (regulate to zero drift)
     double prev_u = m_Solver->getCurrentU();
     double current_u = m_Solver->computeDeltaU(x_aug, 0.0);
     double guideVal = -(current_u - prev_u);
+
+    // Predict next state for the observer
+    if (nx == 6)
+    {
+        double delta_u = current_u - prev_u;
+        m_XhatPred = m_Plant->getAaug() * m_Xhat + m_Plant->getBaug() * delta_u;
+    }
 
     // Apply minMove threshold
     QString comment;
@@ -170,7 +299,7 @@ double MPCGuider::guide(double offset)
         comment = "Harmonic auto-tuned (R=1.0)";
     }
 
-    qCDebug(KSTARS_EKOS_GUIDE) << QString("MPCGuide(%1,%2) Q=%3 R=%4 dt=%5s dx=%6 d_omega=%7 offset=%8 --> %9: %10")
+    qDebug() << QString("MPCGuide(%1,%2) Q=%3 R=%4 dt=%5s dx=%6 d_omega=%7 offset=%8 --> %9: %10")
                                .arg(m_ID, 3).arg(m_GuiderIteration, 3).arg(m_Q, 4, 'f', 1).arg(activeR, 4, 'f', 2)
                                .arg(dt, 4, 'f', 2).arg(delta_theta, 5, 'f', 2).arg(delta_omega, 5, 'f', 2)
                                .arg(offset, 5, 'f', 2).arg(guideVal, 5, 'f', 2).arg(comment);

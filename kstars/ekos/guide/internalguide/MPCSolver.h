@@ -23,6 +23,8 @@ public:
 
     double getCurrentU() const { return current_u_; }
     void setCurrentU(double u) { current_u_ = u; }
+    const Eigen::RowVectorXd& getKx() const { return Kx_; }
+    double getKr() const { return Kr_; }
 
 private:
     double Q_; // Tracking error penalty
@@ -36,4 +38,5 @@ private:
     double current_u_ = 0.0;
     double last_delta_u_ = 0.0;
     double backlash_ = 0.0;
+    double last_dist_ = 0.0;
 };

@@ -411,6 +411,7 @@ if (INDI_FOUND)
             ekos/guide/internalguide/linearguider.cpp
             ekos/guide/internalguide/hysteresisguider.cpp
             ekos/guide/internalguide/mpcguider.cpp
+            ekos/guide/internalguide/fftperiodestimator.cpp
             ekos/guide/internalguide/LaguerreNetwork.cpp
             ekos/guide/internalguide/TelescopePlant.cpp
             ekos/guide/internalguide/MPCSolver.cpp

@@ -19,8 +19,77 @@ void TelescopePlant::discretize() {
     Ad_ = Eigen::Matrix2d::Identity();
     Bd_ = Eigen::Vector2d::Zero();
 
-    // Determine if we should use the Rigid (3-state) or Flexible (5-state) model
-    if (Ks_ > 1e7 || J_axis_ < 1e-6) {
+    if (omega1_ > 0.0) {
+        // --- PREDICTIVE IMP MODE (6-state MPC) ---
+        
+        double p = Bf_ / J_motor_;
+        if (std::abs(p) < 1e-6) {
+            Ad_ << 1.0, dt_,
+                   0.0, 1.0;
+            Bd_ << 0.5 * Kt_ * dt_ * dt_ / J_motor_,
+                   Kt_ * dt_ / J_motor_;
+        } else {
+            double exp_pt = std::exp(-p * dt_);
+            Ad_ << 1.0, (1.0 - exp_pt) / p,
+                   0.0, exp_pt;
+            Bd_ << Kt_ * (dt_ / p - (1.0 - exp_pt) / (p * p)) / J_motor_,
+                   Kt_ * (1.0 - exp_pt) / (p * J_motor_);
+        }
+
+        // Discrete matrices for disturbance blocks (damped harmonic oscillators for asymptotic stability)
+        double zeta = 0.0;
+
+        Eigen::Matrix2d Az1d = Eigen::Matrix2d::Zero();
+        if (omega1_ > 0.0) {
+            double wd1 = omega1_ * std::sqrt(1.0 - zeta * zeta);
+            double c1 = std::cos(wd1 * dt_);
+            double s1 = std::sin(wd1 * dt_);
+            double decay1 = std::exp(-zeta * omega1_ * dt_);
+            Az1d << c1 + (zeta * omega1_ / wd1) * s1, s1 / wd1,
+                    -(omega1_ * omega1_ / wd1) * s1, c1 - (zeta * omega1_ / wd1) * s1;
+            Az1d *= decay1;
+        } else {
+            Az1d = Eigen::Matrix2d::Identity();
+        }
+
+        Eigen::Matrix2d Az2d = Eigen::Matrix2d::Zero();
+        if (omega2_ > 0.0) {
+            double wd2 = omega2_ * std::sqrt(1.0 - zeta * zeta);
+            double c2 = std::cos(wd2 * dt_);
+            double s2 = std::sin(wd2 * dt_);
+            double decay2 = std::exp(-zeta * omega2_ * dt_);
+            Az2d << c2 + (zeta * omega2_ / wd2) * s2, s2 / wd2,
+                    -(omega2_ * omega2_ / wd2) * s2, c2 - (zeta * omega2_ / wd2) * s2;
+            Az2d *= decay2;
+        } else {
+            Az2d = Eigen::Matrix2d::Identity();
+        }
+
+        // Assemble 6x6 matrices Ad6_, Bd6_, Cd6_
+        Ad6_ = Eigen::MatrixXd::Zero(6, 6);
+        Ad6_.block<2,2>(0,0) = Ad_;
+        Ad6_.block<2,2>(2,2) = Az1d;
+        Ad6_.block<2,2>(4,4) = Az2d;
+
+        Bd6_ = Eigen::VectorXd::Zero(6);
+        Bd6_.segment<2>(0) = Bd_;
+
+        Cd6_ = Eigen::RowVectorXd::Zero(6);
+        Cd6_(0) = 1.0;
+        Cd6_(2) = 1.0;
+        Cd6_(4) = (omega2_ > 0.0) ? 1.0 : 0.0;
+
+        // IMP mode uses a 6-state augmented system directly.
+        // The output y = Cd6 * x = motor_pos + d1 + d2 is penalized via the
+        // output-tracking cost in MPCSolver (Q_matrix = Q * Cd^T * Cd).
+        // Using Cd6 * x as output avoids the double-counting bug that arises
+        // when a 7th integrator-of-y row mixes absolute harmonic values with
+        // incremental B inputs.
+        system_order_ = 6;
+        Aaug_ = Ad6_;
+        Baug_ = Bd6_;
+        Caug_ = Cd6_;
+    } else if (Ks_ > 1e7 || J_axis_ < 1e-6) {
         // --- RIGID MODE (3-state MPC) ---
         system_order_ = 3;
         
@@ -41,6 +110,8 @@ void TelescopePlant::discretize() {
         Aaug_ = Eigen::MatrixXd::Zero(3, 3);
         Aaug_.block<2,2>(0,0) = Ad_;
         Aaug_.block<1,2>(2,0) = Ad_.row(0); // theta(k+1) is the first row of Ad * x
+        Aaug_(2, 0) = 0.0; // Clear motor position coupling to prevent prediction double-counting
+        Aaug_(2, 1) = 0.0; // Clear motor velocity coupling to prevent prediction double-counting
         Aaug_(2,2) = 1.0;
 
         Baug_ = Eigen::VectorXd::Zero(3);
@@ -84,6 +155,8 @@ void TelescopePlant::discretize() {
         
         // Update Axis Position (theta_a is the 3rd state, index 2, in Ad_4)
         Aaug_.block<1,4>(4,0) = Ad_4.row(2);
+        Aaug_(4, 0) = 0.0; // Clear motor position coupling to prevent prediction double-counting
+        Aaug_(4, 1) = 0.0; // Clear motor velocity coupling to prevent prediction double-counting
         Aaug_(4,4) = 1.0;
 
         Baug_ = Eigen::VectorXd::Zero(5);

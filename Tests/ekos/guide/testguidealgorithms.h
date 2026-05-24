@@ -39,4 +39,6 @@ private slots:
     // MPCGuider
     void testMPCGuiderConstantDrift();
     void testMPCGuiderPE();
+    void testMPCPredictiveDisturbanceCancellation();
+    void testMPCDynamicFFTRebuild();
 };

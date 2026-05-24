@@ -28,44 +28,48 @@ void MPCSolver::rebuildMatrices(const TelescopePlant& plant, const LaguerreNetwo
     // Get adaptive matrices from the universal plant
     const Eigen::MatrixXd& A_aug = plant.getAaug();
     const Eigen::VectorXd& B_aug = plant.getBaug();
-    const Eigen::RowVectorXd& C_aug = plant.getCaug();
     
     // phi_T stores \sum A^{m-i-1} B L(i)^T at each step
     Eigen::MatrixXd phi_T = Eigen::MatrixXd::Zero(nx, N);
     Eigen::MatrixXd A_pow = Eigen::MatrixXd::Identity(nx, nx);
     
-    // Define a state weighting matrix Q_matrix
-    // For Rigid N=3: [0, 0, Q] - only position
-    // For Flexible N=5: [0, 0.1, 0, 0.5, Q] - dampen velocities
+    // Q_matrix weights the state cost per prediction step.
+    // For IMP mode (nx==6): output-tracking cost y = Caug*x, so Q_matrix = Q * Caug^T * Caug.
+    // This naturally penalizes the harmonic displacement states (indices 2,4) via the
+    // observation matrix Caug = [1,0,1,0,1,0], enabling pre-emptive IMP cancellation.
     Eigen::MatrixXd Q_matrix = Eigen::MatrixXd::Zero(nx, nx);
     if (nx == 3) {
         Q_matrix(2, 2) = Q_;
+    } else if (nx == 6) {
+        // Output-tracking: penalize y = Caug * x
+        const Eigen::RowVectorXd& Cd = plant.getCaug();
+        Q_matrix = Q_ * Cd.transpose() * Cd;
     } else {
         Q_matrix(1, 1) = Q_ * 0.1; // Motor velocity damping
-        Q_matrix(3, 3) = Q_ * 10.0; // Axis velocity damping (Aggressive vibration suppression)
+        Q_matrix(3, 3) = Q_ * 10.0; // Axis velocity damping
         Q_matrix(4, 4) = Q_;       // Axis position tracking
     }
-    
+
+    // q_target: direction in state space toward the reference output.
+    // For output-tracking (nx==6): q_target = Q * Caug^T.
+    // For position-tracking (others): q_target points at last state.
+    Eigen::VectorXd q_target = Eigen::VectorXd::Zero(nx);
+    if (nx == 6) {
+        q_target = Q_ * plant.getCaug().transpose();
+    } else {
+        q_target(nx-1) = Q_;
+    }
+
     Eigen::VectorXd current_L = network.getInitialState();
-    
+
     for (int m = 1; m <= Np_; ++m) {
         // Recursive prediction update (Matrix-Vector form)
         phi_T = A_aug * phi_T + B_aug * current_L.transpose();
-        
-        A_pow = A_pow * A_aug;
-        
-        // Cost = Predict(x)^T * Q * Predict(x)
-        // Predict(x) = A_pow * x + phi_T * coefficients
-        // Contribution to Omega (Hessian): phi_T^T * Q * phi_T
-        Omega += phi_T.transpose() * Q_matrix * phi_T + current_L * R_ * current_L.transpose();
-        
-        // Contribution to Psi_x (State feedback): phi_T^T * Q * A_pow
-        Psi_x += phi_T.transpose() * Q_matrix * A_pow;
 
-        // Contribution to Psi_r (Reference tracking): phi_T^T * Q_vec * target
-        // Since setpoint only applies to position (last state)
-        Eigen::VectorXd q_target = Eigen::VectorXd::Zero(nx);
-        q_target(nx-1) = Q_;
+        A_pow = A_pow * A_aug;
+
+        Omega += phi_T.transpose() * Q_matrix * phi_T + current_L * R_ * current_L.transpose();
+        Psi_x += phi_T.transpose() * Q_matrix * A_pow;
         Psi_r += phi_T.transpose() * q_target;
 
         current_L = network.step(current_L);
@@ -103,9 +107,8 @@ double MPCSolver::computeDeltaU(const Eigen::VectorXd& x_aug, double setpoint, d
     double delta_u_mpc = Kr_ * setpoint - Kx_.dot(x_aug);
     
     // 2. Disturbance Feedforward (DOB)
-    static double last_dist = 0.0;
-    double delta_u_dist = -(disturbance_estimate - last_dist);
-    last_dist = disturbance_estimate;
+    double delta_u_dist = -(disturbance_estimate - last_dist_);
+    last_dist_ = disturbance_estimate;
 
     double delta_u = delta_u_mpc + delta_u_dist;
 

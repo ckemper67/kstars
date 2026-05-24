@@ -9,6 +9,8 @@
 #include <QDateTime>
 #include <QString>
 #include <memory>
+#include <Eigen/Dense>
+#include "fftperiodestimator.h"
 
 class MPCSolver;
 class TelescopePlant;
@@ -46,6 +48,20 @@ class MPCGuider
         std::unique_ptr<TelescopePlant> m_Plant;
         std::unique_ptr<LaguerreNetwork> m_Network;
         std::unique_ptr<MPCSolver> m_Solver;
+
+        // FFT active frequency learning
+        std::unique_ptr<FFTPeriodEstimator> m_FFTEstimator;
+        double m_Omega1 { 0.0 };
+        double m_Omega2 { 0.0 };
+        double m_LearnedT1 { 0.0 };
+        double m_LearnedT2 { 0.0 };
+        bool m_PeriodsLearned { false };
+
+        double m_LastActiveR { -1.0 };
+
+        // Luenberger Observer vectors
+        Eigen::VectorXd m_Xhat;
+        Eigen::VectorXd m_XhatPred;
 
         bool m_Initialized { false };
         double m_LastDt { 0.0 };

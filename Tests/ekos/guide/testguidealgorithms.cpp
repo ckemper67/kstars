@@ -49,7 +49,8 @@ template <typename Guider>
 static ClosedLoopStats runClosedLoop(Guider &g, int frames,
                                      double driftPerFrame,
                                      double peAmplitude, double peFramesPeriod,
-                                     double noiseSigma, uint32_t seed)
+                                     double noiseSigma, uint32_t seed,
+                                     bool evalAtNextMeas = false)
 {
     double position = 0.0;
     double sumSqOpen = 0.0, sumSqAll = 0.0, sumSqFinal = 0.0;
@@ -78,9 +79,25 @@ static ClosedLoopStats runClosedLoop(Guider &g, int frames,
         double corr  = g.guide(meas);
         position    -= corr;
 
-        sumSqAll += position * position;
+        // Evaluate post-correction position by default. For predictive guiders,
+        // evalAtNextMeas evaluates at the next measurement time instead --
+        // that is what the next exposure actually sees and what predictive
+        // controllers (MPC with IMP) are designed to drive to zero.
+        double evalPos = position;
+        if (evalAtNextMeas)
+        {
+            evalPos += driftPerFrame;
+            if (peAmplitude > 0.0 && peFramesPeriod > 0.0)
+            {
+                double peCurr = peAmplitude * std::sin(2.0 * M_PI * i / peFramesPeriod);
+                double peNext = peAmplitude * std::sin(2.0 * M_PI * (i + 1) / peFramesPeriod);
+                evalPos += (peNext - peCurr);
+            }
+        }
+
+        sumSqAll += evalPos * evalPos;
         if (i >= frames - nFinal)
-            sumSqFinal += position * position;
+            sumSqFinal += evalPos * evalPos;
     }
 
     return {
@@ -549,6 +566,48 @@ void TestGuideAlgorithms::testMPCGuiderPE()
 
     // Must remain bounded and stable
     QVERIFY(r.finalRMS < amplitude * 2.0);
+}
+
+void TestGuideAlgorithms::testMPCPredictiveDisturbanceCancellation()
+{
+    MPCGuider g("RA");
+    g.setParameters(20.0, 0.1);
+    g.setMinMove(0.0);
+
+    const int frames = 300;
+    const double amplitude = 4.0;
+    const double period = 30.0; // frames
+
+    // Predictive IMP: evaluate at next measurement (what the next exposure sees),
+    // not at post-correction (which is the motor pre-positioned for that exposure).
+    auto r = runClosedLoop(g, frames, 0.0, amplitude, period, 0.05, 42, true);
+
+    qDebug() << "MPCPredictiveDisturbanceCancellation openRMS=" << r.openLoopRMS
+             << "finalRMS=" << r.finalRMS;
+
+    // Closed-loop final RMS should be extremely small (< 0.5") due to pre-emptive IMP cancellation
+    QVERIFY(r.finalRMS < 0.5);
+}
+
+void TestGuideAlgorithms::testMPCDynamicFFTRebuild()
+{
+    MPCGuider g("RA");
+    g.setParameters(20.0, 0.1);
+    g.setMinMove(0.0);
+
+    // Verify that after enough frames, the guider identifies the worm period,
+    // reconstructs state, and successfully suppresses error below 15% of open loop
+    const int frames = 200;
+    const double amplitude = 3.0;
+    const double period = 25.0; // frames
+
+    // Predictive IMP: evaluate at next measurement, not post-correction.
+    auto r = runClosedLoop(g, frames, 0.0, amplitude, period, 0.02, 42, true);
+
+    qDebug() << "MPCDynamicFFTRebuild openRMS=" << r.openLoopRMS
+             << "finalRMS=" << r.finalRMS;
+
+    QVERIFY(r.finalRMS < r.openLoopRMS * 0.15);
 }
 
 QTEST_GUILESS_MAIN(TestGuideAlgorithms)

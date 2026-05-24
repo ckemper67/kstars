@@ -276,6 +276,226 @@ static void printRow(const Stats &r, bool showDetrend = false)
 }
 
 // ---------------------------------------------------------------------------
+// 2-Mass Flexible Shaft Simulation
+// ---------------------------------------------------------------------------
+
+struct Sim2MassParams {
+    double Jm = 0.02;   // Motor reflected inertia
+    double Ja = 0.5;    // Axis inertia
+    double Bf = 0.1;    // Motor friction damping
+    double Ba = 0.1;    // Axis friction damping
+    double Ks = 200.0;  // Gear Stiffness
+    double Bs = 2.0;    // Gear Damping
+    double Kt = 1.0;
+    double stiction = 1.5;
+    double coulomb = 0.5;
+};
+
+template <typename Guider>
+static Stats runCL2Mass(const std::string &name, Guider &g,
+                        int frames, double exposure,
+                        double driftPerFrame, const PEParams &peParams,
+                        double noiseSigma, uint32_t seed,
+                        const Sim2MassParams &sim,
+                        const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed;
+    double theta_m = 0.0;
+    double omega_m = 0.0;
+    double theta_a = 0.0;
+    double omega_a = 0.0;
+    
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    double h = 0.002;
+    int stepsPerFrame = static_cast<int>(exposure / h);
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) theta_a += delta;
+
+        double t_start = i * exposure;
+        theta_a += driftPerFrame;
+        theta_m += driftPerFrame;
+
+        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
+        sqOpen += openPos * openPos;
+
+        double meas = theta_a + gaussNoise(sn, noiseSigma);
+        double corr = g.guide(meas);
+        theta_m -= corr;
+
+        // Multi-rate physical integration loop for compliance/vibrations/friction
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            double current_t = t_start + s * h;
+            
+            double pe = absHarmonicPE(peParams, current_t);
+            double arg = 2.0 * M_PI * current_t / peParams.T;
+            double pe_rate = (peParams.T > 0.0) ? (peParams.A1 * (2.0 * M_PI / peParams.T) * std::cos(arg)
+                             + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
+                             + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
+            
+            double T_spring = sim.Ks * (theta_m - theta_a + pe) + sim.Bs * (omega_m - omega_a + pe_rate);
+            
+            double omega_m_dot = (-sim.Bf * omega_m - T_spring) / sim.Jm;
+            theta_m += h * omega_m;
+            omega_m += h * omega_m_dot;
+            
+            double T_friction = 0.0;
+            if (std::abs(omega_a) < 1e-4) {
+                if (std::abs(T_spring) < sim.stiction) {
+                    T_friction = T_spring; // stuck
+                    omega_a = 0.0;
+                } else {
+                    T_friction = sim.coulomb * (T_spring > 0.0 ? 1.0 : -1.0);
+                }
+            } else {
+                T_friction = sim.coulomb * (omega_a > 0.0 ? 1.0 : -1.0);
+            }
+            
+            double omega_a_dot = (T_spring - sim.Ba * omega_a - T_friction) / sim.Ja;
+            theta_a += h * omega_a;
+            omega_a += h * omega_a_dot;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    double oRMS = std::sqrt(sqOpen / frames);
+    double aRMS = std::sqrt(sqAll  / frames);
+    double fRMS = std::sqrt(sqFinal / nFinal);
+    double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
+static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
+                           int frames, double exposure,
+                           double driftPerFrame, const PEParams &peParams,
+                           double noiseSigma, uint32_t seed,
+                           const Sim2MassParams &sim,
+                           const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed;
+    double theta_m = 0.0;
+    double omega_m = 0.0;
+    double theta_a = 0.0;
+    double omega_a = 0.0;
+    
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    double h = 0.002;
+    int stepsPerFrame = static_cast<int>(exposure / h);
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) theta_a += delta;
+
+        double t_start = i * exposure;
+        theta_a += driftPerFrame;
+        theta_m += driftPerFrame;
+
+        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
+        sqOpen += openPos * openPos;
+
+        double meas = theta_a + gaussNoise(sn, noiseSigma);
+        double corr = gpg.result(meas, 100.0, exposure);
+        theta_m -= corr;
+
+        // Multi-rate physical integration loop for compliance/vibrations/friction
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            double current_t = t_start + s * h;
+            
+            double pe = absHarmonicPE(peParams, current_t);
+            double arg = 2.0 * M_PI * current_t / peParams.T;
+            double pe_rate = (peParams.T > 0.0) ? (peParams.A1 * (2.0 * M_PI / peParams.T) * std::cos(arg)
+                             + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
+                             + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
+            
+            double T_spring = sim.Ks * (theta_m - theta_a + pe) + sim.Bs * (omega_m - omega_a + pe_rate);
+            
+            double omega_m_dot = (-sim.Bf * omega_m - T_spring) / sim.Jm;
+            theta_m += h * omega_m;
+            omega_m += h * omega_m_dot;
+            
+            double T_friction = 0.0;
+            if (std::abs(omega_a) < 1e-4) {
+                if (std::abs(T_spring) < sim.stiction) {
+                    T_friction = T_spring; // stuck
+                    omega_a = 0.0;
+                } else {
+                    T_friction = sim.coulomb * (T_spring > 0.0 ? 1.0 : -1.0);
+                }
+            } else {
+                T_friction = sim.coulomb * (omega_a > 0.0 ? 1.0 : -1.0);
+            }
+            
+            double omega_a_dot = (T_spring - sim.Ba * omega_a - T_friction) / sim.Ja;
+            theta_a += h * omega_a;
+            omega_a += h * omega_a_dot;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    double oRMS = std::sqrt(sqOpen / frames);
+    double aRMS = std::sqrt(sqAll  / frames);
+    double fRMS = std::sqrt(sqFinal / nFinal);
+    double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
+static void runComplianceScenario(const char *title,
+                                  int frames, double exposure,
+                                  double driftPerFrame, const PEParams &pe,
+                                  double noiseSigma, double gpgInitPeriod,
+                                  const Sim2MassParams &sim,
+                                  bool gpgLearn = true)
+{
+    const uint32_t SEED = 42;
+
+    {
+        LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+        auto r = runCL2Mass("LinearGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+        printHeader(title);
+        printRow(r);
+    }
+    {
+        HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+        auto r = runCL2Mass("HysteresisGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+        printRow(r);
+    }
+    {
+        GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, gpgLearn));
+        gpg.SetLearningRate(1.0);
+        auto r = runCLGPG2Mass("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+        printRow(r);
+    }
+    {
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+        printRow(r);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scenario runners
 // ---------------------------------------------------------------------------
 
@@ -535,6 +755,46 @@ int main(int argc, char *argv[])
             "H6: Drift + harmonics  drift=0.05\"/frame  T=30s  A1=3.5\" A2=1.4\" A3=0.7\"  frames=600  noise=0.25\"\n"
             "    [DeTrend removes linear drift component so harmonic correction is visible]",
             600, 2.0, 0.05, pe, 0.25, 100.0, true);
+    }
+
+    // H7: Torsional Compliance & Resonance
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
+        Sim2MassParams sim;
+        sim.Ks = 250.0; // Moderate stiffness
+        sim.Bs = 2.0;   // Moderate damping
+        sim.stiction = 0.0; // Clean compliance
+        sim.coulomb = 0.0;
+        runComplianceScenario(
+            "H7: Torsional Compliance & Resonance  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=250.0  Bs=2.0\n"
+            "    [Simulates torsional wind-up & resonant mount vibrations; MPC cancels pre-emptively]",
+            400, 2.0, 0.0, pe, 0.10, 100.0, sim);
+    }
+
+    // H8: Static Friction + Compliance Wind-Up
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
+        Sim2MassParams sim;
+        sim.Ks = 200.0; // More flexible shaft
+        sim.Bs = 2.0;
+        sim.stiction = 1.5; // High stiction
+        sim.coulomb = 0.5;   // High Coulomb friction
+        runComplianceScenario(
+            "H8: Static Friction + Compliance Wind-Up  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=200  stiction=1.5Nm\n"
+            "    [Simulates stiction stick-slip / deadband play; MPC deadband punch-through suppresses wind-up]",
+            400, 2.0, 0.0, pe, 0.10, 100.0, sim);
+    }
+
+    // H9: Fully Adaptive PE Learning
+    {
+        PEParams pe;
+        pe.T = 40.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8; // Unknown frequency T=40s
+        runHarmonicScenario(
+            "H9: Fully Adaptive PE Learning  T=40s  A1=4.0\" A2=1.6\" A3=0.8\"  (Unknown period)\n"
+            "    [Verifies active frequency estimator converges to unknown period T=40s and schedules IMP cancellation]",
+            500, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
     printf("\n");
