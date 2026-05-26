@@ -56,6 +56,9 @@ constexpr int PE_HALFRECT = 3;  // A1 * max(0, sin(wt))
 struct PEParams
 {
     double T       = 0.0;  // fundamental period (s), 0 = no PE
+    double Tdot    = 0.0;  // period drift rate (s/s); 0 = constant period.
+                           // T(t) = T + Tdot*t. Phase is the time-integral of
+                           // 2*pi/T(t), so frequency = 2*pi/T(t) exactly.
     double A1      = 0.0;  // fundamental amplitude (arcsec)
     double A2      = 0.0;  // 2nd harmonic amplitude
     double A3      = 0.0;  // 3rd harmonic amplitude
@@ -69,33 +72,45 @@ struct PEParams
     int    waveform= PE_HARMONIC;  // PE_HARMONIC | PE_SAWTOOTH | PE_TRIANGLE | PE_HALFRECT
 };
 
+// Time-integrated phase: integral_0^t (2*pi/T(tau)) dtau, with T(tau) = T0 + Tdot*tau.
+// Linear T drift gives a logarithmic phase. With Tdot=0 this is the standard 2*pi*t/T.
+static inline double driftingPhase(double T0, double Tdot, double t)
+{
+    if (std::abs(Tdot) < 1e-12) return 2.0 * M_PI * t / T0;
+    return (2.0 * M_PI / Tdot) * std::log(1.0 + Tdot * t / T0);
+}
+
 // Harmonic + envelope + hysteresis component only (no OU, no seed consumed).
 static double absHarmonicPE(const PEParams &pe, double t)
 {
     if (pe.T <= 0.0) return 0.0;
 
+    double arg = driftingPhase(pe.T, pe.Tdot, t);
+
     double v = 0.0;
     if (pe.waveform == PE_HARMONIC)
     {
-        double arg = 2.0 * M_PI * t / pe.T;
         v = pe.A1 * std::sin(arg)
           + pe.A2 * std::sin(2.0 * arg + pe.phi2)
           + pe.A3 * std::sin(3.0 * arg + pe.phi3);
     }
     else if (pe.waveform == PE_SAWTOOTH)
     {
-        double phase = t / pe.T - std::floor(t / pe.T); // [0, 1)
+        // Use the cumulative phase modulo 2*pi to define the sawtooth cycle,
+        // so drift propagates correctly through the wrap.
+        double phase = arg / (2.0 * M_PI);
+        phase -= std::floor(phase);  // [0, 1)
         v = pe.A1 * (2.0 * phase - 1.0);
     }
     else if (pe.waveform == PE_TRIANGLE)
     {
-        double phase = t / pe.T - std::floor(t / pe.T);
+        double phase = arg / (2.0 * M_PI);
+        phase -= std::floor(phase);
         v = (phase < 0.5) ? pe.A1 * (4.0 * phase - 1.0)
                           : pe.A1 * (3.0 - 4.0 * phase);
     }
     else if (pe.waveform == PE_HALFRECT)
     {
-        double arg = 2.0 * M_PI * t / pe.T;
         v = pe.A1 * std::max(0.0, std::sin(arg));
     }
 
@@ -103,10 +118,10 @@ static double absHarmonicPE(const PEParams &pe, double t)
         v *= 1.0 + pe.modDepth * std::sin(2.0 * M_PI * t / pe.modT);
     if (pe.hystLag > 0.0)
     {
-        // Use the fundamental-mode velocity sign for direction lag; for non-sine
-        // waveforms this is a reasonable approximation since the sign changes
-        // at the same zero-crossings.
-        double vel = pe.A1 * (2.0 * M_PI / pe.T) * std::cos(2.0 * M_PI * t / pe.T);
+        // Velocity sign of the fundamental sinusoid (for direction-lag); the
+        // instantaneous frequency is 2*pi/T(t), so cos(arg)*sign matches the
+        // zero-crossings even with drift.
+        double vel = pe.A1 * (2.0 * M_PI / (pe.T + pe.Tdot * t)) * std::cos(arg);
         v += pe.hystLag * (vel >= 0.0 ? 1.0 : -1.0);
     }
     return v;
@@ -924,6 +939,35 @@ int main(int argc, char *argv[])
             "H13: True backlash  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=400.0  backlash=1.0\"\n"
             "    [direction-dependent deadband at each PE zero-crossing; exercises punch-through compensation]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
+    }
+
+    // H14: Period drift -- worm period changes slowly over the run
+    // Real harmonic-drive/worm-gear mounts drift in period with temperature.
+    // ~1-5% per hour is typical. Test uses 10% drift over the run to make
+    // adaptation visible. MPC's FFT updates every 10 frames; GPG runs
+    // gradient-based period inference. Both should adapt; the question is
+    // how cleanly.
+    // T0=30s, Tdot=0.0025 s/s -> T grows from 30s to ~33s over 1200s = 600 frames.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.Tdot = 0.0025; pe.A1 = 4.0;
+        runHarmonicScenario(
+            "H14: Period drift  T0=30s -> ~33s over 600 frames  A=4.0\"  noise=0.10\"\n"
+            "    [worm period drifts 10% over the run; tests FFT (MPC) vs gradient (GPG) re-tracking]",
+            600, 2.0, 0.0, pe, 0.10, 30.0);
+    }
+
+    // H15: Mid-run plant change -- step disturbance at frame 200 on top of
+    // ongoing PE. Simulates focus shift, refraction change, or worm contact
+    // zone change. Tests adaptive recovery: pre-step settled performance vs
+    // post-step transient.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 5.0;
+        runH5Scenario(
+            "H15: Mid-run amplitude step  T=30s  A1=5.0\"  +3\" step at fr200\n"
+            "    [adaptive recovery test: sudden plant change requiring re-learning]",
+            400, 2.0, pe, 0.10, 30.0, 200, +3.0);
     }
 
     printf("\n");
