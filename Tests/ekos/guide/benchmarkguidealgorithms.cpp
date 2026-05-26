@@ -678,13 +678,13 @@ static void runComplianceScenario(const char *title,
     }
     {
         MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
-        // Note: do NOT pass sim.backlash through setBacklash() here. The
-        // current MPCSolver punch-through triggers on EVERY commanded
-        // current_u zero-crossing, which fires constantly under sinusoidal
-        // PE and over-compensates (H13 1.19" -> 1.40" when enabled).
-        // The punch-through model needs gating (e.g., only after a long
-        // direction hold, or scaled by predicted motion) before it can be
-        // wired up safely. The API on MPCGuider is in place for future use.
+        // MPCSolver's punch-through now requires kPunchSustained=10 frames
+        // of sustained current_u direction before firing on a reversal, so
+        // it stays dormant under high-frequency PE (where reversals happen
+        // every ~PE_period/2/dt frames) and only fires when the cumulative
+        // command has held one side long enough that the gear gap really
+        // needs traversal.
+        if (sim.backlash > 0.0) g.setBacklash(sim.backlash);
         auto r = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
         printRow(r);
     }
@@ -1288,6 +1288,26 @@ int main(int argc, char *argv[])
             "H15: Mid-run amplitude step  T=30s  A1=5.0\"  +3\" step at fr200\n"
             "    [adaptive recovery test: sudden plant change requiring re-learning]",
             400, 2.0, pe, 0.10, 30.0, 200, +3.0);
+    }
+
+    // H16: Slow worm PE + backlash. Long worm period (T=480s) means current_u
+    // reverses only ~once per ~60 frames. The smarter punch-through trigger
+    // requires kPunchSustained=10 frames of sustained direction before firing,
+    // so it stays dormant on H13's fast PE (T=30s, reversal every ~7 frames)
+    // but engages here where actual backlash-gap traversal happens.
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 5.0;
+        Sim2MassParams sim;
+        sim.Ks = 400.0;
+        sim.Bs = 4.0;
+        sim.stiction = 0.0;
+        sim.coulomb = 0.0;
+        sim.backlash = 1.0;
+        runComplianceScenario(
+            "H16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
+            "    [long-period PE so sustained direction holds; punch-through engages on each true reversal]",
+            360, 4.0, 0.0, pe, 0.10, 480.0, sim);
     }
 
     printf("\n");

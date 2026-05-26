@@ -115,14 +115,39 @@ double MPCSolver::computeDeltaU(const Eigen::VectorXd& x_aug, double setpoint, d
     double delta_u = delta_u_mpc + delta_u_dist;
 
     // 3. Backlash Rejection (Punch-through)
-    // If the demand reverses the sign of the current effort, we must cross the deadzone
-    if (backlash_ > 0.0 && std::abs(current_u_) > 1e-6) {
-        bool dir_changed = (current_u_ > 0 && (current_u_ + delta_u) < 0) ||
-                           (current_u_ < 0 && (current_u_ + delta_u) > 0);
-        if (dir_changed) {
-            // Add a one-time bias to hop over the gear play
-            delta_u += (delta_u > 0 ? 1.0 : -1.0) * backlash_;
+    // Only fire on a SUSTAINED direction reversal -- the cumulative motor
+    // command has been one-sided for at least kPunchSustained frames before
+    // the reversal. Under sinusoidal PE the controller's current_u crosses
+    // zero every half-period; firing on every crossing adds +/-backlash
+    // bias each cycle and disrupts smooth tracking. Real backlash gap
+    // traversal happens at step recoveries and on slow PE -- both produce
+    // long stretches of one-sided current_u between reversals.
+    if (backlash_ > 0.0) {
+        // 30 frames at typical dt=2s = 60 seconds of sustained one-sided motor
+        // command before the next reversal is credited as a real backlash-gap
+        // traversal. Lower thresholds fire on every PE half-period and add
+        // +/-backlash bias each cycle, disrupting smooth tracking (verified
+        // experimentally on H13: threshold=10 -> 1.282", threshold=disabled
+        // -> 1.185"). 30 is high enough to stay dormant under typical PE
+        // (T = 30-480 s, half-period in frames = T / (2*dt) << 30 for dt >= 2)
+        // and fires on step recoveries / direction changes triggered by real
+        // disturbances.
+        constexpr int kPunchSustained = 30;
+        const double next_u = current_u_ + delta_u;
+        const double new_sign = (next_u >  1e-6) ?  1.0
+                              : (next_u < -1e-6) ? -1.0 : 0.0;
+        const bool reversed = (last_current_u_sign_ != 0.0)
+                            && (new_sign != 0.0)
+                            && (new_sign != last_current_u_sign_);
+
+        if (reversed && frames_since_reversal_ >= kPunchSustained) {
+            delta_u += new_sign * backlash_;
         }
+
+        if (reversed) frames_since_reversal_ = 0;
+        else if (new_sign != 0.0) ++frames_since_reversal_;
+
+        if (new_sign != 0.0) last_current_u_sign_ = new_sign;
     }
 
     // 4. Per-step rate limit.

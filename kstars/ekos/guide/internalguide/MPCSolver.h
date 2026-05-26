@@ -39,4 +39,15 @@ private:
     double last_delta_u_ = 0.0;
     double backlash_ = 0.0;
     double last_dist_ = 0.0;
+
+    // Backlash punch-through state. The simple "fire on every current_u
+    // zero-crossing" trigger fires on every PE crossing under sinusoidal
+    // disturbance and over-corrects. We require N frames of sustained
+    // current_u direction before crediting the next reversal as a real
+    // backlash-gap traversal.
+    double last_current_u_sign_ = 0.0;     // +1, -1, or 0 (unset)
+    int    frames_since_reversal_ = 0;     // start at 0 so the first reversal
+                                           // does not spuriously fire before
+                                           // any sustained direction has been
+                                           // established
 };
