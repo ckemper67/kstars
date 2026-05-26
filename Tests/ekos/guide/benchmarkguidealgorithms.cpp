@@ -153,9 +153,17 @@ static Stats runCL(const std::string &name, Guider &g,
         double meas = pos + gaussNoise(sn, noiseSigma);
         pos -= g.guide(meas);
 
-        sqAll += pos * pos;
-        if (i >= frames - nFinal) { sqFinal += pos*pos; finalPos.push_back(pos); }
-        if (collectAll) allPos.push_back(pos);
+        // Evaluate at the next measurement time (what the next exposure will see),
+        // not the post-correction position at this frame. Predictive guiders pre-position
+        // the motor for the next PE value, so post-correction is intentionally offset
+        // by -delta_PE; next-meas is the actual photon-arrival residual.
+        // OU/noise contributions to the next frame are stochastic and omitted here.
+        double nextPE = absHarmonicPE(pe, t + exposure);
+        double evalPos = pos + driftPerFrame + (nextPE - absHarmonicPE(pe, t));
+
+        sqAll += evalPos * evalPos;
+        if (i >= frames - nFinal) { sqFinal += evalPos * evalPos; finalPos.push_back(evalPos); }
+        if (collectAll) allPos.push_back(evalPos);
     }
 
     double oRMS = std::sqrt(sqOpen / frames);
@@ -196,9 +204,13 @@ static Stats runCLGPG(const std::string &name, GaussianProcessGuider &gpg,
         double meas = pos + gaussNoise(sn, noiseSigma);
         pos -= gpg.result(meas, 100.0, exposure);
 
-        sqAll += pos * pos;
-        if (i >= frames - nFinal) { sqFinal += pos*pos; finalPos.push_back(pos); }
-        if (collectAll) allPos.push_back(pos);
+        // Evaluate at next measurement time (see runCL note above).
+        double nextPE = absHarmonicPE(pe, t + exposure);
+        double evalPos = pos + driftPerFrame + (nextPE - absHarmonicPE(pe, t));
+
+        sqAll += evalPos * evalPos;
+        if (i >= frames - nFinal) { sqFinal += evalPos * evalPos; finalPos.push_back(evalPos); }
+        if (collectAll) allPos.push_back(evalPos);
     }
 
     double oRMS = std::sqrt(sqOpen / frames);
