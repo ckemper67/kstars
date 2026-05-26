@@ -125,9 +125,22 @@ double MPCSolver::computeDeltaU(const Eigen::VectorXd& x_aug, double setpoint, d
         }
     }
 
+    // 4. Per-step rate limit.
+    // The MPC gains assume the commanded delta_u takes effect immediately on
+    // the measured output (rigid pure-integrator plant). When the actual mount
+    // has unmodeled dynamics (compliance, stiction, large transport delay) the
+    // controller can issue catastrophically large corrections trying to fix
+    // what it sees. Capping the per-step demand prevents single-step blowups
+    // while still allowing cumulative drift correction over many frames.
+    // 5" per frame is well above typical guide pulses (sub-arcsec) but bounds
+    // the worst-case excursion under plant-model mismatch.
+    const double MAX_DELTA_U = 5.0;
+    if (delta_u >  MAX_DELTA_U) delta_u =  MAX_DELTA_U;
+    if (delta_u < -MAX_DELTA_U) delta_u = -MAX_DELTA_U;
+
     current_u_ += delta_u;
     last_delta_u_ = delta_u;
-    
+
     return current_u_;
 }
 
