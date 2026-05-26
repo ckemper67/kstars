@@ -44,6 +44,15 @@ static double gaussNoise(uint32_t &s, double sigma)
 //   - OU stochastic:        Ornstein-Uhlenbeck process added to above
 // ---------------------------------------------------------------------------
 
+// PE waveform shapes. Real worm-gear PE is often non-sinusoidal: sawtooth
+// (slow buildup, fast snap), triangle (constant velocity reversals), or
+// half-rectified (single-sided drive). These expose how well a guider
+// handles waveforms whose Fourier spectrum is rich in harmonics.
+constexpr int PE_HARMONIC = 0;  // A1 sin(wt) + A2 sin(2wt+phi2) + A3 sin(3wt+phi3)
+constexpr int PE_SAWTOOTH = 1;  // linear ramp -A1 to +A1, then snap
+constexpr int PE_TRIANGLE = 2;  // -A1 to +A1 over half period, then back
+constexpr int PE_HALFRECT = 3;  // A1 * max(0, sin(wt))
+
 struct PEParams
 {
     double T       = 0.0;  // fundamental period (s), 0 = no PE
@@ -57,21 +66,47 @@ struct PEParams
     double hystLag = 0.0;  // directional lag amplitude (arcsec), 0 = none
     double ouTau   = 0.0;  // OU correlation time (s), 0 = none
     double ouSigSS = 0.0;  // OU steady-state sigma (arcsec)
+    int    waveform= PE_HARMONIC;  // PE_HARMONIC | PE_SAWTOOTH | PE_TRIANGLE | PE_HALFRECT
 };
 
 // Harmonic + envelope + hysteresis component only (no OU, no seed consumed).
 static double absHarmonicPE(const PEParams &pe, double t)
 {
     if (pe.T <= 0.0) return 0.0;
-    double arg = 2.0 * M_PI * t / pe.T;
-    double v = pe.A1 * std::sin(arg)
-             + pe.A2 * std::sin(2.0 * arg + pe.phi2)
-             + pe.A3 * std::sin(3.0 * arg + pe.phi3);
+
+    double v = 0.0;
+    if (pe.waveform == PE_HARMONIC)
+    {
+        double arg = 2.0 * M_PI * t / pe.T;
+        v = pe.A1 * std::sin(arg)
+          + pe.A2 * std::sin(2.0 * arg + pe.phi2)
+          + pe.A3 * std::sin(3.0 * arg + pe.phi3);
+    }
+    else if (pe.waveform == PE_SAWTOOTH)
+    {
+        double phase = t / pe.T - std::floor(t / pe.T); // [0, 1)
+        v = pe.A1 * (2.0 * phase - 1.0);
+    }
+    else if (pe.waveform == PE_TRIANGLE)
+    {
+        double phase = t / pe.T - std::floor(t / pe.T);
+        v = (phase < 0.5) ? pe.A1 * (4.0 * phase - 1.0)
+                          : pe.A1 * (3.0 - 4.0 * phase);
+    }
+    else if (pe.waveform == PE_HALFRECT)
+    {
+        double arg = 2.0 * M_PI * t / pe.T;
+        v = pe.A1 * std::max(0.0, std::sin(arg));
+    }
+
     if (pe.modT > 0.0)
         v *= 1.0 + pe.modDepth * std::sin(2.0 * M_PI * t / pe.modT);
     if (pe.hystLag > 0.0)
     {
-        double vel = pe.A1 * (2.0 * M_PI / pe.T) * std::cos(arg);
+        // Use the fundamental-mode velocity sign for direction lag; for non-sine
+        // waveforms this is a reasonable approximation since the sign changes
+        // at the same zero-crossings.
+        double vel = pe.A1 * (2.0 * M_PI / pe.T) * std::cos(2.0 * M_PI * t / pe.T);
         v += pe.hystLag * (vel >= 0.0 ? 1.0 : -1.0);
     }
     return v;
@@ -301,7 +336,25 @@ struct Sim2MassParams {
     double Kt = 1.0;
     double stiction = 1.5;
     double coulomb = 0.5;
+    double backlash = 0.0; // arcsec; gear play (deadband in motor-axis coupling).
+                           // 0 = rigid teeth contact; >0 = no spring force while
+                           // |theta_m - theta_a + pe| < backlash.
 };
+
+// Compute the gear spring torque accounting for an optional backlash deadband.
+// When |relative position| <= backlash, the gear teeth are not in contact and
+// no force transmits through the gear (T_spring = 0). Beyond the deadband the
+// spring engages with deflection reduced by the deadband width.
+static inline double computeSpringTorque(double rel_pos, double rel_vel,
+                                         double Ks, double Bs, double backlash)
+{
+    if (backlash <= 0.0) {
+        return Ks * rel_pos + Bs * rel_vel;
+    }
+    if (rel_pos >  backlash) return Ks * (rel_pos - backlash) + Bs * rel_vel;
+    if (rel_pos < -backlash) return Ks * (rel_pos + backlash) + Bs * rel_vel;
+    return 0.0;
+}
 
 template <typename Guider>
 static Stats runCL2Mass(const std::string &name, Guider &g,
@@ -351,7 +404,9 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
                              + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
                              + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
             
-            double T_spring = sim.Ks * (theta_m - theta_a + pe) + sim.Bs * (omega_m - omega_a + pe_rate);
+            double T_spring = computeSpringTorque(theta_m - theta_a + pe,
+                                                  omega_m - omega_a + pe_rate,
+                                                  sim.Ks, sim.Bs, sim.backlash);
             
             double omega_m_dot = (-sim.Bf * omega_m - T_spring) / sim.Jm;
             theta_m += h * omega_m;
@@ -436,7 +491,9 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
                              + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
                              + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
             
-            double T_spring = sim.Ks * (theta_m - theta_a + pe) + sim.Bs * (omega_m - omega_a + pe_rate);
+            double T_spring = computeSpringTorque(theta_m - theta_a + pe,
+                                                  omega_m - omega_a + pe_rate,
+                                                  sim.Ks, sim.Bs, sim.backlash);
             
             double omega_m_dot = (-sim.Bf * omega_m - T_spring) / sim.Jm;
             theta_m += h * omega_m;
@@ -807,6 +864,66 @@ int main(int argc, char *argv[])
             "H9: Fully Adaptive PE Learning  T=40s  A1=4.0\" A2=1.6\" A3=0.8\"  (Unknown period)\n"
             "    [Verifies active frequency estimator converges to unknown period T=40s and schedules IMP cancellation]",
             500, 2.0, 0.0, pe, 0.10, 100.0);
+    }
+
+    // H10: Sawtooth PE -- worm with slow drift, fast snap-back
+    // Real worms with single-tooth-pitch error look like sawtooth: linear
+    // build-up then sharp return at the tooth-engagement transition.
+    // FFT picks up the fundamental at T plus a Fourier comb 2T, 3T, ...;
+    // MPC's 2-oscillator IMP only models two of those harmonics.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_SAWTOOTH;
+        runHarmonicScenario(
+            "H10: Sawtooth PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "    [non-sinusoidal worm error; harmonic-rich spectrum tests how many modes IMP captures]",
+            400, 2.0, 0.0, pe, 0.10, 100.0);
+    }
+
+    // H11: Triangle PE -- constant-velocity reversals
+    // Common in mounts with friction-limited motor velocity; the worm tracks
+    // linearly then reverses cleanly. Discontinuity in velocity (not position).
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_TRIANGLE;
+        runHarmonicScenario(
+            "H11: Triangle PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "    [constant-velocity ramps with mid-period sign reversal; tests transient response at direction change]",
+            400, 2.0, 0.0, pe, 0.10, 100.0);
+    }
+
+    // H12: Half-rectified PE -- single-sided drive train error
+    // Half-period zero, half-period sine. Strong DC + harmonic content. The
+    // MPC's IMP, which models pure sinusoidal d1/d2, cannot match the DC
+    // component without help from the motor state.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_HALFRECT;
+        runHarmonicScenario(
+            "H12: Half-rectified PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "    [single-sided worm-tooth error; large DC bias plus harmonic spectrum]",
+            400, 2.0, 0.0, pe, 0.10, 100.0);
+    }
+
+    // H13: True backlash (direction-dependent deadband)
+    // Worm-and-wheel gear play: when motor reverses, axis stays put until
+    // the +/- backlash gap is traversed. Different from H4's hysteresis lag
+    // (which is a signed force offset). MPCSolver has a backlash punch-through
+    // path that triggers on commanded direction changes -- this scenario tests
+    // it. Compliance is mild (Ks=400) so the backlash effect is isolated.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
+        Sim2MassParams sim;
+        sim.Ks = 400.0;     // Stiffer than H7/H8 to isolate backlash effect
+        sim.Bs = 4.0;       // More damped
+        sim.stiction = 0.0; // No stiction
+        sim.coulomb = 0.0;
+        sim.backlash = 1.0; // 1 arcsec of gear play (typical for hobby mounts)
+        runComplianceScenario(
+            "H13: True backlash  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=400.0  backlash=1.0\"\n"
+            "    [direction-dependent deadband at each PE zero-crossing; exercises punch-through compensation]",
+            400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
     printf("\n");
