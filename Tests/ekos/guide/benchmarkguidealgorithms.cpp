@@ -1292,7 +1292,7 @@ int main(int argc, char *argv[])
 
     // H16: Slow worm PE + backlash. Long worm period (T=480s) means current_u
     // reverses only ~once per ~60 frames. The smarter punch-through trigger
-    // requires kPunchSustained=10 frames of sustained direction before firing,
+    // requires kPunchSustained=30 frames of sustained direction before firing,
     // so it stays dormant on H13's fast PE (T=30s, reversal every ~7 frames)
     // but engages here where actual backlash-gap traversal happens.
     {
@@ -1307,6 +1307,32 @@ int main(int argc, char *argv[])
         runComplianceScenario(
             "H16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
             "    [long-period PE so sustained direction holds; punch-through engages on each true reversal]",
+            360, 4.0, 0.0, pe, 0.10, 480.0, sim);
+    }
+
+    // H17: Slow-response motor + larger backlash. Models a direct-drive or
+    // low-reduction mount where the motor itself has significant inertia
+    // (Jm=0.5 vs the default 0.02 -> ~25x heavier). Motor time constant
+    // tau = Jm/Bf = 0.5/0.05 = 10s -> several frames at dt=4s to settle.
+    // Backlash=2" is double H16 to make gap traversal a multi-frame event.
+    // This is the scenario where backlash punch-through should actually help:
+    // the motor takes time to cross the gap, so pre-positioning it via
+    // punch-through is a real benefit.
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 5.0;
+        Sim2MassParams sim;
+        sim.Jm = 0.5;       // Slow motor (vs default 0.02)
+        sim.Bf = 0.05;      // Less damping
+        sim.Ks = 300.0;
+        sim.Bs = 3.0;
+        sim.stiction = 0.0;
+        sim.coulomb = 0.0;
+        sim.backlash = 2.0; // Larger gap
+        runComplianceScenario(
+            "H17: Slow-response motor + backlash  T=480s  A=5.0\"  Jm=0.5  backlash=2.0\"\n"
+            "    [direct-drive style mount: motor takes several frames to settle;\n"
+            "     gap traversal is a multi-frame event where punch-through should help]",
             360, 4.0, 0.0, pe, 0.10, 480.0, sim);
     }
 
