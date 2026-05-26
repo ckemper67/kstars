@@ -16,8 +16,10 @@
 
 #include <QCoreApplication>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -338,6 +340,51 @@ static void printRow(const Stats &r, bool showDetrend = false)
 }
 
 // ---------------------------------------------------------------------------
+// Tuning mode: per-scenario parameter sweep per algorithm
+// ---------------------------------------------------------------------------
+// When g_tune is true, the benchmark sweeps a small parameter grid for each
+// algorithm in each scenario and reports both the default-parameter result
+// and the best-found result side by side. Default false (existing fast run).
+
+static bool g_tune = false;
+
+// Sweep grids (kept small to bound runtime; ~49 runs per scenario).
+static const std::vector<double> kLinearGain    = { 0.3, 0.5, 0.7, 0.9 };
+static const std::vector<int>    kLinearLength  = { 10, 25, 50 };
+static const std::vector<double> kHystGain      = { 0.3, 0.5, 0.7, 0.9 };
+static const std::vector<double> kHystValue     = { 0.0, 0.2, 0.5 };
+static const std::vector<double> kGpgCtrlGain   = { 0.6, 0.8, 1.0 };
+static const std::vector<double> kGpgPKLengthSc = { 5.0, 10.0, 20.0 };
+static const std::vector<double> kMpcQ          = { 5.0, 10.0, 20.0, 50.0 };
+static const std::vector<double> kMpcR          = { 0.05, 0.1, 0.5, 1.0 };
+
+static void printTunedHeader(const char *title)
+{
+    printf("\n%s\n", title);
+    printf("  %-22s  %10s  %10s  %s\n",
+           "Algorithm", "Default", "Best", "Best params");
+    printf("  %-22s  %10s  %10s  %s\n",
+           "----------------------", "----------", "----------", "------------");
+}
+
+static void printTunedRow(const char *algo, const Stats &def,
+                          const Stats &best, const std::string &bestParams)
+{
+    printf("  %-22s  %9.3f\"  %9.3f\"  %s\n",
+           algo, def.finalRMS, best.finalRMS, bestParams.c_str());
+}
+
+static inline std::string fmtParams(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return std::string(buf);
+}
+
+// ---------------------------------------------------------------------------
 // 2-Mass Flexible Shaft Simulation
 // ---------------------------------------------------------------------------
 
@@ -555,6 +602,63 @@ static void runComplianceScenario(const char *title,
 {
     const uint32_t SEED = 42;
 
+    if (g_tune)
+    {
+        printTunedHeader(title);
+        // LinearGuider
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCL2Mass("LinearGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+            Stats sBest = sDef; std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCL2Mass("LinearGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printTunedRow("LinearGuider", sDef, sBest, bestP);
+        }
+        // HysteresisGuider
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL2Mass("HysteresisGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+            Stats sBest = sDef; std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCL2Mass("HysteresisGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printTunedRow("HysteresisGuider", sDef, sBest, bestP);
+        }
+        // GPG
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgInitPeriod, gpgLearn));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPG2Mass("GPG (learn)", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+            Stats sBest = sDef; std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgInitPeriod, gpgLearn);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPG2Mass("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printTunedRow("GPG (learn)", sDef, sBest, bestP);
+        }
+        // MPCGuider
+        {
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL2Mass("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
+        return;
+    }
+
     {
         LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
         auto r = runCL2Mass("LinearGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
@@ -602,6 +706,63 @@ static void runScenario(const char *title,
     pe.A1 = peA;
 
     const uint32_t SEED = 42;
+
+    if (g_tune)
+    {
+        printTunedHeader(title);
+        // LinearGuider sweep
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCL("LinearGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+            Stats sBest = sDef; std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCL("LinearGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printTunedRow("LinearGuider", sDef, sBest, bestP);
+        }
+        // HysteresisGuider sweep
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("HysteresisGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+            Stats sBest = sDef; std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCL("HysteresisGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printTunedRow("HysteresisGuider", sDef, sBest, bestP);
+        }
+        // GPG sweep (over control_gain x PKLengthScale; PKSignalVariance, period kept at defaults)
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgPeriod, gpgLearn));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPG("GPG", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+            Stats sBest = sDef; std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgPeriod, gpgLearn);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPG("GPG", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printTunedRow("GPG", sDef, sBest, bestP);
+        }
+        // MPCGuider sweep
+        {
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
+        return;
+    }
 
     {
         LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
@@ -662,6 +823,88 @@ static void runH5Scenario(const char *title,
                r.algo.c_str(), preRMS, immRMS, lateRMS);
     };
 
+    // For H5-style scenarios we sweep on the "Late recovery" segment RMS,
+    // since that captures settled performance after the step disturbance.
+    auto lateRMSof = [&](const Stats &r) {
+        return segRMS(r.allPositions, frames - nWindow, frames);
+    };
+
+    if (g_tune)
+    {
+        printf("\n%s\n", title);
+        printf("  step: %+.1f\" at frame %d (t=%.0fs)  swept on Late(recov)\n",
+               stepDelta, stepFrame, stepFrame * exposure);
+        printf("  %-22s  %10s  %10s  %s\n",
+               "Algorithm", "Default", "Best", "Best params");
+        printf("  %-22s  %10s  %10s  %s\n",
+               "----------------------", "----------", "----------", "------------");
+
+        auto printH5Tuned = [&](const char *algo, double defLate, double bestLate, const std::string &p) {
+            printf("  %-22s  %9.3f\"  %9.3f\"  %s\n", algo, defLate, bestLate, p.c_str());
+        };
+
+        // LinearGuider
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCL("LinearGuider", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+            double defLate = lateRMSof(sDef), bestLate = defLate;
+            std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCL("LinearGuider", g, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+                double late = lateRMSof(s);
+                if (late < bestLate) { bestLate = late; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printH5Tuned("LinearGuider", defLate, bestLate, bestP);
+        }
+        // HysteresisGuider
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("HysteresisGuider", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+            double defLate = lateRMSof(sDef), bestLate = defLate;
+            std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCL("HysteresisGuider", g, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+                double late = lateRMSof(s);
+                if (late < bestLate) { bestLate = late; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printH5Tuned("HysteresisGuider", defLate, bestLate, bestP);
+        }
+        // GPG
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgInitPeriod, true));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPG("GPG (learn)", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+            double defLate = lateRMSof(sDef), bestLate = defLate;
+            std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgInitPeriod, true);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPG("GPG (learn)", gpg, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+                double late = lateRMSof(s);
+                if (late < bestLate) { bestLate = late; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printH5Tuned("GPG (learn)", defLate, bestLate, bestP);
+        }
+        // MPCGuider
+        {
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+            double defLate = lateRMSof(sDef), bestLate = defLate;
+            std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+                double late = lateRMSof(s);
+                if (late < bestLate) { bestLate = late; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printH5Tuned("MPCGuider", defLate, bestLate, bestP);
+        }
+        return;
+    }
+
     {
         LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
         auto r = runCL("LinearGuider", g, frames, exposure, 0.0, pe,
@@ -698,6 +941,63 @@ static void runHarmonicScenario(const char *title,
                                 const Steps &steps = {})
 {
     const uint32_t SEED = 42;
+
+    if (g_tune)
+    {
+        printTunedHeader(title);
+        // LinearGuider
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCL("LinearGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCL("LinearGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printTunedRow("LinearGuider", sDef, sBest, bestP);
+        }
+        // HysteresisGuider
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("HysteresisGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCL("HysteresisGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printTunedRow("HysteresisGuider", sDef, sBest, bestP);
+        }
+        // GPG (learn=true)
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgInitPeriod, true));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPG("GPG (learn)", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+            Stats sBest = sDef; std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgInitPeriod, true);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPG("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printTunedRow("GPG (learn)", sDef, sBest, bestP);
+        }
+        // MPCGuider
+        {
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
+        return;
+    }
 
     {
         LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
@@ -736,12 +1036,25 @@ int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--tune") == 0) g_tune = true;
+    }
+
     printf("=== Guide Algorithm RMSE Benchmark ===\n");
-    printf("Open RMS:  uncorrected mount error over all frames\n");
-    printf("All RMS:   corrected residual, all frames (includes learning transient)\n");
-    printf("Final RMS: corrected residual, last quarter (algorithm should have converged)\n");
-    printf("Reduction: (1 - Final/Open) x 100%%\n");
-    printf("DeTrend:   final-quarter RMS after removing linear drift (H6 only)\n");
+    if (g_tune) {
+        printf("Mode: TUNING (per-scenario parameter sweep, ~10 min)\n");
+        printf("Each row shows the default-param result and the best from a small\n");
+        printf("sweep. Sweeps: LinearGuider gain*length (4*3=12), HysteresisGuider\n");
+        printf("gain*hysteresis (4*3=12), GPG control_gain*PKLengthScale (3*3=9),\n");
+        printf("MPCGuider Q*R (4*4=16). Pass without --tune for the fast benchmark.\n\n");
+    } else {
+        printf("Open RMS:  uncorrected mount error over all frames\n");
+        printf("All RMS:   corrected residual, all frames (includes learning transient)\n");
+        printf("Final RMS: corrected residual, last quarter (algorithm should have converged)\n");
+        printf("Reduction: (1 - Final/Open) x 100%%\n");
+        printf("DeTrend:   final-quarter RMS after removing linear drift (H6 only)\n");
+        printf("(Pass --tune to run per-scenario parameter sweeps for each algorithm.)\n");
+    }
 
     // -----------------------------------------------------------------------
     // Original worm gear scenarios (GPG pre-tuned to true period)
