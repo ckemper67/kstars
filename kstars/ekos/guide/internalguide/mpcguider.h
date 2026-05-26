@@ -24,6 +24,10 @@ class MPCGuider
 
         void setParameters(double Q, double R, double J = 1e-6, double Bf = 1.0, double Kt = 1.0, int N = 10, double alpha = 0.5);
         void setMinMove(double minMove) { m_MinMove = minMove; }
+        // Configure gear backlash (arcsec). When >0, the solver's punch-through
+        // path injects a one-shot bias on commanded direction reversals to
+        // cross the deadband. Set to the known/measured mount backlash.
+        void setBacklash(double b) { m_Backlash = b; m_Initialized = false; }
 
         // Time is implicitly computed. Returns correction in arcseconds.
         double guide(double offset);
@@ -44,6 +48,7 @@ class MPCGuider
         double m_Kt { 1.0 };
         int m_N { 10 };
         double m_alpha { 0.5 };
+        double m_Backlash { 0.0 };
 
         std::unique_ptr<TelescopePlant> m_Plant;
         std::unique_ptr<LaguerreNetwork> m_Network;

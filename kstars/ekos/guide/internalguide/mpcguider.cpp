@@ -204,7 +204,13 @@ double MPCGuider::guide(double offset)
         double oldU = m_Solver ? m_Solver->getCurrentU() : 0.0;
         m_Kt = m_Bf / dt; // Enforce unit step gain for pure integrator plant in guiding
         m_Plant = std::make_unique<TelescopePlant>(m_J, m_Bf, m_Kt, dt);
-        
+        if (m_Backlash > 0.0)
+        {
+            // MPCSolver picks this up via plant.getBacklash() in rebuildMatrices
+            // and activates its punch-through path on commanded direction changes.
+            m_Plant->setBacklash(m_Backlash);
+        }
+
         if (m_PeriodsLearned && m_Omega1 > 0.0)
         {
             m_Plant->setDisturbanceFrequencies(m_Omega1, m_Omega2);

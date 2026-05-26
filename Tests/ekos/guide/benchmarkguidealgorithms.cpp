@@ -574,6 +574,13 @@ static void runComplianceScenario(const char *title,
     }
     {
         MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        // Note: do NOT pass sim.backlash through setBacklash() here. The
+        // current MPCSolver punch-through triggers on EVERY commanded
+        // current_u zero-crossing, which fires constantly under sinusoidal
+        // PE and over-compensates (H13 1.19" -> 1.40" when enabled).
+        // The punch-through model needs gating (e.g., only after a long
+        // direction hold, or scaled by predicted motion) before it can be
+        // wired up safely. The API on MPCGuider is in place for future use.
         auto r = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
         printRow(r);
     }
