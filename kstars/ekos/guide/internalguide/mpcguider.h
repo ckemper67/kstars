@@ -29,6 +29,19 @@ class MPCGuider
         // cross the deadband. Set to the known/measured mount backlash.
         void setBacklash(double b) { m_Backlash = b; m_Initialized = false; }
 
+        // Declare a compliant mount (motor-axis 2-mass coupling). Ks is spring
+        // stiffness (Nm/rad), Bs is spring damping (Nm*s/rad), J_axis is axis
+        // inertia (kg*m^2). When set such that Ks < 1e7 and J_axis > 1e-6, the
+        // plant builds a 5-state flexible model instead of the default rigid
+        // pure-integrator. This is a user-declared configuration, not online
+        // detection. Setting Ks=0 (or leaving unset) restores rigid behavior.
+        // NOTE: compliance and the FFT-driven IMP path are currently mutually
+        // exclusive -- declaring compliance suppresses the 7-state IMP rebuild
+        // so the 5-state flexible plant is used. Full flexible-IMP fusion
+        // (9 states) is a follow-up.
+        void setMechanicalParams(double Ks, double Bs, double J_axis)
+        { m_Ks = Ks; m_Bs = Bs; m_J_axis = J_axis; m_Initialized = false; }
+
         // Time is implicitly computed. Returns correction in arcseconds.
         double guide(double offset);
 
@@ -49,6 +62,10 @@ class MPCGuider
         int m_N { 10 };
         double m_alpha { 0.5 };
         double m_Backlash { 0.0 };
+        // Mechanical compliance parameters (0 = rigid, default).
+        double m_Ks { 0.0 };
+        double m_Bs { 0.0 };
+        double m_J_axis { 0.0 };
 
         std::unique_ptr<TelescopePlant> m_Plant;
         std::unique_ptr<LaguerreNetwork> m_Network;

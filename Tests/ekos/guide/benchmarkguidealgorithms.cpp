@@ -598,7 +598,8 @@ static void runComplianceScenario(const char *title,
                                   double driftPerFrame, const PEParams &pe,
                                   double noiseSigma, double gpgInitPeriod,
                                   const Sim2MassParams &sim,
-                                  bool gpgLearn = true)
+                                  bool gpgLearn = true,
+                                  bool declareCompliance = false)
 {
     const uint32_t SEED = 42;
 
@@ -646,11 +647,21 @@ static void runComplianceScenario(const char *title,
         }
         // MPCGuider
         {
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            auto configureMPC = [&](MPCGuider &mpc, double Q, double R) {
+                if (declareCompliance)
+                    mpc.setParameters(Q, R, sim.Jm, sim.Bf, sim.Kt);
+                else
+                    mpc.setParameters(Q, R);
+                mpc.setMinMove(0.1);
+                if (sim.backlash > 0.0) mpc.setBacklash(sim.backlash);
+                if (declareCompliance && sim.Ks > 0.0 && sim.Ja > 0.0)
+                    mpc.setMechanicalParams(sim.Ks, sim.Bs, sim.Ja);
+            };
+            MPCGuider gd("RA"); configureMPC(gd, 10.0, 0.1);
             Stats sDef = runCL2Mass("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); configureMPC(g, Q, R);
                 Stats s = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -677,7 +688,22 @@ static void runComplianceScenario(const char *title,
         printRow(r);
     }
     {
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        MPCGuider g("RA");
+        // When the caller has opted in to compliance declaration, pass the
+        // simulator's actual motor inertia and damping so the controller's
+        // plant model matches the rig. The default J=1e-6 assumes an
+        // effectively massless motor (rigid pure-integrator limit); for
+        // compliant 2-mass scenarios with a heavy motor this is wrong by
+        // orders of magnitude. Without declareCompliance the controller
+        // keeps its rigid pure-integrator approximation -- which is what
+        // H7/H8/H16 relied on before the compliance routing was added; their
+        // 5-state flexible matrices are numerically unstable under
+        // 2nd-order Taylor discretization (Ks/Jm ratio too large at dt=2s).
+        if (declareCompliance)
+            g.setParameters(10.0, 0.1, sim.Jm, sim.Bf, sim.Kt);
+        else
+            g.setParameters(10.0, 0.1);
+        g.setMinMove(0.1);
         // MPCSolver's punch-through now requires kPunchSustained=10 frames
         // of sustained current_u direction before firing on a reversal, so
         // it stays dormant under high-frequency PE (where reversals happen
@@ -685,6 +711,19 @@ static void runComplianceScenario(const char *title,
         // command has held one side long enough that the gear gap really
         // needs traversal.
         if (sim.backlash > 0.0) g.setBacklash(sim.backlash);
+        // Declare compliance to the controller (opt-in per scenario). The
+        // 2-mass simulator already models finite Ks/Bs and a separate axis
+        // inertia; feeding those into MPCGuider builds the matching 5-state
+        // flexible plant instead of the rigid pure-integrator. Without this
+        // declaration, the controller assumes rigid coupling and issues
+        // catastrophically large corrections on stiff systems (H17
+        // specifically). The opt-in is required because the existing
+        // 2nd-order Taylor discretization in TelescopePlant is unstable for
+        // Ks/Jm >> 1/dt^2 (typical worm-drive ratios with the default light
+        // motor); H17 stays just inside the stability envelope because of
+        // its heavy direct-drive motor.
+        if (declareCompliance && sim.Ks > 0.0 && sim.Ja > 0.0)
+            g.setMechanicalParams(sim.Ks, sim.Bs, sim.Ja);
         auto r = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
         printRow(r);
     }
@@ -1306,8 +1345,11 @@ int main(int argc, char *argv[])
         sim.backlash = 1.0;
         runComplianceScenario(
             "H16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
-            "    [long-period PE so sustained direction holds; punch-through engages on each true reversal]",
-            360, 4.0, 0.0, pe, 0.10, 480.0, sim);
+            "    [long-period PE so sustained direction holds; punch-through engages on each true reversal;\n"
+            "     MPC opts in to compliance declaration -> 5-state flexible plant]",
+            360, 4.0, 0.0, pe, 0.10, 480.0, sim,
+            /*gpgLearn=*/true,
+            /*declareCompliance=*/true);
     }
 
     // H17: Slow-response motor + larger backlash. Models a direct-drive or
@@ -1332,8 +1374,11 @@ int main(int argc, char *argv[])
         runComplianceScenario(
             "H17: Slow-response motor + backlash  T=480s  A=5.0\"  Jm=0.5  backlash=2.0\"\n"
             "    [direct-drive style mount: motor takes several frames to settle;\n"
-            "     gap traversal is a multi-frame event where punch-through should help]",
-            360, 4.0, 0.0, pe, 0.10, 480.0, sim);
+            "     gap traversal is a multi-frame event where punch-through should help;\n"
+            "     MPC opts in to compliance declaration -> 5-state flexible plant]",
+            360, 4.0, 0.0, pe, 0.10, 480.0, sim,
+            /*gpgLearn=*/true,
+            /*declareCompliance=*/true);
     }
 
     printf("\n");

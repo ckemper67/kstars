@@ -211,7 +211,21 @@ double MPCGuider::guide(double offset)
             m_Plant->setBacklash(m_Backlash);
         }
 
-        if (m_PeriodsLearned && m_Omega1 > 0.0)
+        // Declared mechanical compliance: route to the 5-state flexible plant.
+        // Compliance is currently mutually exclusive with the 7-state IMP path:
+        // we skip setDisturbanceFrequencies even if periods were learned, since
+        // TelescopePlant has no fused flexible-IMP model yet. The trade-off is
+        // losing predictive PE cancellation on compliant mounts in exchange
+        // for a model that actually represents the 2-mass coupling.
+        const bool complianceDeclared = (m_Ks > 0.0 && m_Ks < 1e7 && m_J_axis > 1e-6);
+        if (complianceDeclared)
+        {
+            m_Plant->setAxisInertia(m_J_axis);
+            m_Plant->setSpringStiffness(m_Ks);
+            m_Plant->setSpringDamping(m_Bs);
+        }
+
+        if (m_PeriodsLearned && m_Omega1 > 0.0 && !complianceDeclared)
         {
             m_Plant->setDisturbanceFrequencies(m_Omega1, m_Omega2);
         }
