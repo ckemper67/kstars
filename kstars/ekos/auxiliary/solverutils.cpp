@@ -11,6 +11,8 @@
 #include <QRegularExpression>
 #include <QUuid>
 
+int SolverUtils::s_MultiAlgorithmOverride = -1;
+
 SolverUtils::SolverUtils(const SSolver::Parameters &parameters, double timeoutSeconds,
                          SSolver::ProcessType type) :
     m_Parameters(parameters), m_TimeoutMilliseconds(timeoutSeconds * 1000.0), m_Type(type)
@@ -223,14 +225,29 @@ void SolverUtils::solverTimeout()
     m_TemporaryFilename.clear();
 }
 
-// We don't trust StellarSolver's mutli-processing algorithm MULTI_DEPTHS which is used
-// with multiAlgorithm==MULTI_AUTO && use_scale && !use_position.
+// StellarSolver's MULTI_AUTO maps hints to algorithms backwards:
+//   both hints -> NOT_MULTI, pos only -> MULTI_SCALES, scale only -> MULTI_DEPTHS.
+// MULTI_DEPTHS needs position to narrow healpix search; without it, solve times
+// blow up 5-14x. MULTI_SCALES wastes threads when scale is already known.
+// Fix: select based on which hints are available.
 void SolverUtils::patchMultiAlgorithm(StellarSolver *solver)
 {
-    if (solver && solver->property("UseScale").toBool() && !solver->property("UsePosition").toBool())
+    if (!solver)
+        return;
+
+    auto params = solver->getCurrentParameters();
+
+    if (s_MultiAlgorithmOverride >= 0)
     {
-        auto currentParameters = solver->getCurrentParameters();
-        currentParameters.multiAlgorithm = NOT_MULTI;
-        solver->setParameters(currentParameters);
+        params.multiAlgorithm = static_cast<SSolver::MultiAlgo>(s_MultiAlgorithmOverride);
+        solver->setParameters(params);
+        return;
+    }
+
+    if (params.multiAlgorithm == MULTI_AUTO)
+    {
+        bool usePosition = solver->property("UsePosition").toBool();
+        params.multiAlgorithm = usePosition ? MULTI_DEPTHS : MULTI_SCALES;
+        solver->setParameters(params);
     }
 }
