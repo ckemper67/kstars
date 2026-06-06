@@ -63,8 +63,9 @@ class SolverUtils : public QObject
             return m_StellarSolver->getNumStarsFound();
         };
 
-        // We don't trust StellarSolver's mutli-processing algorithm MULTI_DEPTHS which is used
-        // with multiAlgorithm==MULTI_AUTO && use_scale && !use_position. This disables that.
+        // We don't trust StellarSolver's multi-processing algorithm MULTI_DEPTHS which is used
+        // with multiAlgorithm==MULTI_AUTO && use_scale && !use_position. Force MULTI_SCALES
+        // unconditionally so all hint combinations benefit from parallel solving.
         static void patchMultiAlgorithm(StellarSolver *solver);
 
     Q_SIGNALS:

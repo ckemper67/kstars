@@ -223,14 +223,18 @@ void SolverUtils::solverTimeout()
     m_TemporaryFilename.clear();
 }
 
-// We don't trust StellarSolver's mutli-processing algorithm MULTI_DEPTHS which is used
-// with multiAlgorithm==MULTI_AUTO && use_scale && !use_position.
+// We don't trust StellarSolver's multi-processing algorithm MULTI_DEPTHS which is used
+// with multiAlgorithm==MULTI_AUTO && use_scale && !use_position. Force MULTI_SCALES
+// unconditionally so all hint combinations benefit from parallel solving.
 void SolverUtils::patchMultiAlgorithm(StellarSolver *solver)
 {
-    if (solver && solver->property("UseScale").toBool() && !solver->property("UsePosition").toBool())
+    if (!solver)
+        return;
+
+    auto params = solver->getCurrentParameters();
+    if (params.multiAlgorithm == MULTI_AUTO || params.multiAlgorithm == MULTI_DEPTHS)
     {
-        auto currentParameters = solver->getCurrentParameters();
-        currentParameters.multiAlgorithm = NOT_MULTI;
-        solver->setParameters(currentParameters);
+        params.multiAlgorithm = MULTI_SCALES;
+        solver->setParameters(params);
     }
 }
