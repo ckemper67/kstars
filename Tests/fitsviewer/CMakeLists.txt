@@ -23,4 +23,5 @@ ADD_CUSTOM_COMMAND( TARGET testfitsdata POST_BUILD
             ${CMAKE_CURRENT_BINARY_DIR}/bahtinov-focus.fits)
 ADD_TEST( NAME FitsDataTest COMMAND testfitsdata )
 SET_TESTS_PROPERTIES( FitsDataTest PROPERTIES LABELS "stable")
+
 endif()
