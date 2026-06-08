@@ -11,6 +11,8 @@
 #include <QRegularExpression>
 #include <QUuid>
 
+int SolverUtils::s_MultiAlgorithmOverride = -1;
+
 SolverUtils::SolverUtils(const SSolver::Parameters &parameters, double timeoutSeconds,
                          SSolver::ProcessType type) :
     m_Parameters(parameters), m_TimeoutMilliseconds(timeoutSeconds * 1000.0), m_Type(type)
@@ -19,7 +21,7 @@ SolverUtils::SolverUtils(const SSolver::Parameters &parameters, double timeoutSe
     connect(&m_SolverTimer, &QTimer::timeout, this, &SolverUtils::solverTimeout, Qt::UniqueConnection);
 
     m_StellarSolver.reset(new StellarSolver());
-    // connect(m_StellarSolver.get(), &StellarSolver::logOutput, this, &SolverUtils::newLog);
+    m_ActiveSolver = m_StellarSolver.get();
 }
 
 SolverUtils::~SolverUtils()
@@ -27,10 +29,9 @@ SolverUtils::~SolverUtils()
     disconnect(&m_Watcher, &QFutureWatcher<bool>::finished, this, &SolverUtils::executeSolver);
     disconnect(&m_SolverTimer, &QTimer::timeout, this, &SolverUtils::solverTimeout);
     if (m_StellarSolver.get())
-    {
-        // disconnect(m_StellarSolver.get(), &StellarSolver::logOutput, this, &SolverUtils::newLog);
         disconnect(m_StellarSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone);
-    }
+    if (m_HedgeSolver.get())
+        disconnect(m_HedgeSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone);
 }
 
 void SolverUtils::executeSolver()
@@ -60,59 +61,86 @@ void SolverUtils::abort(bool wait)
         else
             m_StellarSolver->abort();
     }
+    if (m_HedgeSolver.get())
+    {
+        if (wait)
+            m_HedgeSolver->abortAndWait();
+        else
+            m_HedgeSolver->abort();
+    }
 }
 
 bool SolverUtils::isRunning() const
 {
-    if (!m_StellarSolver.get()) return false;
-    return m_StellarSolver->isRunning();
+    if (m_StellarSolver && m_StellarSolver->isRunning()) return true;
+    if (m_HedgeSolver && m_HedgeSolver->isRunning()) return true;
+    return false;
 }
 
 void SolverUtils::getSolutionHealpix(int *indexUsed, int *healpixUsed) const
 {
-    *indexUsed = m_StellarSolver->getSolutionIndexNumber();
-    *healpixUsed = m_StellarSolver->getSolutionHealpix();
+    *indexUsed = m_ActiveSolver->getSolutionIndexNumber();
+    *healpixUsed = m_ActiveSolver->getSolutionHealpix();
 }
 
-
-void SolverUtils::prepareSolver(const bool stack)
+void SolverUtils::configureSolver(StellarSolver *solver, const bool stack)
 {
-    if (m_StellarSolver->isRunning())
-        m_StellarSolver->abort();
-    m_StellarSolver->setProperty("ProcessType", m_Type);
+    if (solver->isRunning())
+        solver->abort();
+    solver->setProperty("ProcessType", m_Type);
     if (stack)
-        m_StellarSolver->loadNewImageBuffer(m_ImageData->getStackStatistics(), m_ImageData->getStackImageBuffer());
+        solver->loadNewImageBuffer(m_ImageData->getStackStatistics(), m_ImageData->getStackImageBuffer());
     else
-        m_StellarSolver->loadNewImageBuffer(m_ImageData->getStatistics(), m_ImageData->getImageBuffer());
-    m_StellarSolver->setProperty("ExtractorType", Options::solveSextractorType());
-    m_StellarSolver->setProperty("SolverType", Options::solverType());
-    connect(m_StellarSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone, Qt::UniqueConnection);
+        solver->loadNewImageBuffer(m_ImageData->getStatistics(), m_ImageData->getImageBuffer());
+    solver->setProperty("ExtractorType", Options::solveSextractorType());
+    solver->setProperty("SolverType", Options::solverType());
 
     if (m_IndexToUse >= 0)
     {
-        // The would only have an effect if Options::solverType() == SOLVER_STELLARSOLVER
         QStringList indexFiles = StellarSolver::getIndexFiles(
                                      Options::astrometryIndexFolderList(), m_IndexToUse, m_HealpixToUse);
-        m_StellarSolver->setIndexFilePaths(indexFiles);
+        solver->setIndexFilePaths(indexFiles);
     }
     else
-        m_StellarSolver->setIndexFolderPaths(Options::astrometryIndexFolderList());
+        solver->setIndexFolderPaths(Options::astrometryIndexFolderList());
 
-    // External program paths
     ExternalProgramPaths externalPaths;
     externalPaths.sextractorBinaryPath = Options::sextractorBinary();
     externalPaths.solverPath = Options::astrometrySolverBinary();
     externalPaths.astapBinaryPath = Options::aSTAPExecutable();
     externalPaths.watneyBinaryPath = Options::watneyBinary();
     externalPaths.wcsPath = Options::astrometryWCSInfo();
-    m_StellarSolver->setExternalFilePaths(externalPaths);
+    solver->setExternalFilePaths(externalPaths);
 
-    //No need for a conf file this way.
-    m_StellarSolver->setProperty("AutoGenerateAstroConfig", true);
+    solver->setProperty("AutoGenerateAstroConfig", true);
 
     auto params = m_Parameters;
     params.partition = Options::stellarSolverPartition();
-    m_StellarSolver->setParameters(params);
+    solver->setParameters(params);
+
+    if (m_UseScale)
+        solver->setSearchScale(m_ScaleLow * 0.8, m_ScaleHigh * 1.2, m_ScaleUnits);
+    else
+        solver->setProperty("UseScale", false);
+
+    if (m_UsePosition)
+        solver->setSearchPositionInDegrees(m_raDegrees, m_decDegrees);
+    else
+        solver->setProperty("UsePosition", false);
+
+    solver->setLogLevel(SSolver::LOG_NONE);
+    solver->setSSLogLevel(SSolver::LOG_NORMAL);
+    connect(solver, &StellarSolver::logOutput, this,
+            [](const QString &msg) { qInfo("StellarSolver: %s", qPrintable(msg)); });
+}
+
+void SolverUtils::prepareSolver(const bool stack)
+{
+    m_HedgeActive = false;
+    m_ActiveSolver = m_StellarSolver.get();
+
+    configureSolver(m_StellarSolver.get(), stack);
+    connect(m_StellarSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone, Qt::UniqueConnection);
 
     m_TemporaryFilename.clear();
 
@@ -134,39 +162,53 @@ void SolverUtils::prepareSolver(const bool stack)
         m_StellarSolver->setProperty("AstrometryAPIURL", Options::astrometryAPIURL());
     }
 
-    if (m_UseScale)
+    // Determine which multi-algorithm to use.
+    int algo = resolveMultiAlgorithm(m_StellarSolver.get());
+
+    const bool canHedge = (algo == MULTI_HEDGE)
+                          && (type == SSolver::SOLVER_STELLARSOLVER)
+                          && (m_Type == SSolver::SOLVE);
+
+    if (canHedge)
     {
-        // Extend search scale from 80% to 120%
-        m_StellarSolver->setSearchScale(m_ScaleLow * 0.8, m_ScaleHigh * 1.2, m_ScaleUnits);
+        auto p1 = m_StellarSolver->getCurrentParameters();
+        p1.multiAlgorithm = MULTI_SCALES;
+        m_StellarSolver->setParameters(p1);
+
+        if (!m_HedgeSolver)
+            m_HedgeSolver.reset(new StellarSolver());
+        configureSolver(m_HedgeSolver.get(), stack);
+        connect(m_HedgeSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone, Qt::UniqueConnection);
+        auto p2 = m_HedgeSolver->getCurrentParameters();
+        p2.multiAlgorithm = MULTI_DEPTHS;
+        m_HedgeSolver->setParameters(p2);
+
+        m_HedgeActive = true;
     }
     else
-        m_StellarSolver->setProperty("UseScale", false);
-
-    if (m_UsePosition)
-        m_StellarSolver->setSearchPositionInDegrees(m_raDegrees, m_decDegrees);
-    else
-        m_StellarSolver->setProperty("UsePosition", false);
-
-    // LOG_ALL is crashy now
-    m_StellarSolver->setLogLevel(SSolver::LOG_NONE);
-    m_StellarSolver->setSSLogLevel(SSolver::LOG_OFF);
-
-    patchMultiAlgorithm(m_StellarSolver.get());
+    {
+        auto params = m_StellarSolver->getCurrentParameters();
+        if (algo != MULTI_HEDGE)
+            params.multiAlgorithm = static_cast<SSolver::MultiAlgo>(algo);
+        else
+            params.multiAlgorithm = MULTI_SCALES;
+        m_StellarSolver->setParameters(params);
+        m_HedgeSolver.reset();
+    }
 }
 
 void SolverUtils::runSolver(const QSharedPointer<FITSData> &data, const bool stack)
 {
-    // Limit the time the solver can run.
     m_SolverTimer.setSingleShot(true);
     m_SolverTimer.setInterval(m_TimeoutMilliseconds);
     m_SolverTimer.start();
-    // Somehow m_SolverTimer's elapsed time can be greater than the interval,
-    // so using this to get more exact times.
     m_StartTime = QDateTime::currentMSecsSinceEpoch();
 
     m_ImageData = data;
     prepareSolver(stack);
     m_StellarSolver->start();
+    if (m_HedgeActive)
+        m_HedgeSolver->start();
 }
 
 SolverUtils &SolverUtils::useScale(bool useIt, double scaleLow, double scaleHigh, SSolver::ScaleUnits units)
@@ -188,6 +230,66 @@ SolverUtils &SolverUtils::usePosition(bool useIt, double raDegrees, double decDe
 
 void SolverUtils::solverDone()
 {
+    StellarSolver *finished = qobject_cast<StellarSolver*>(sender());
+    if (!finished)
+        finished = m_StellarSolver.get();
+
+    if (m_HedgeActive)
+    {
+        bool success;
+        FITSImage::Solution solution;
+
+        if (m_Type == SSolver::SOLVE)
+        {
+            success = finished->solvingDone() && !finished->failed();
+            if (success)
+                solution = finished->getSolution();
+        }
+        else
+        {
+            success = finished->extractionDone() && !finished->failed();
+        }
+
+        if (success)
+        {
+            const double elapsed = (QDateTime::currentMSecsSinceEpoch() - m_StartTime) / 1000.0;
+            m_SolverTimer.stop();
+            m_HedgeActive = false;
+            m_ActiveSolver = finished;
+
+            StellarSolver *other = (finished == m_StellarSolver.get())
+                ? m_HedgeSolver.get() : m_StellarSolver.get();
+            disconnect(other, &StellarSolver::finished, this, &SolverUtils::solverDone);
+            other->abort();
+
+            const char *result = (finished == m_StellarSolver.get()) ? "MULTI_SCALES" : "MULTI_DEPTHS";
+            qInfo("Hedge result: %s in %.1fs", result, elapsed);
+
+            Q_EMIT done(false, true, solution, elapsed);
+            if (!m_TemporaryFilename.isEmpty())
+                QFile::remove(m_TemporaryFilename);
+            m_TemporaryFilename.clear();
+            return;
+        }
+
+        // This solver failed. If the other is still running, wait for it.
+        StellarSolver *other = (finished == m_StellarSolver.get())
+            ? m_HedgeSolver.get() : m_StellarSolver.get();
+        if (other && other->isRunning())
+            return;
+
+        // Both failed.
+        const double elapsed = (QDateTime::currentMSecsSinceEpoch() - m_StartTime) / 1000.0;
+        m_SolverTimer.stop();
+        m_HedgeActive = false;
+        Q_EMIT done(false, false, FITSImage::Solution(), elapsed);
+        if (!m_TemporaryFilename.isEmpty())
+            QFile::remove(m_TemporaryFilename);
+        m_TemporaryFilename.clear();
+        return;
+    }
+
+    // Non-hedge path (original logic).
     const double elapsed = (QDateTime::currentMSecsSinceEpoch() - m_StartTime) / 1000.0;
     m_SolverTimer.stop();
 
@@ -214,6 +316,10 @@ void SolverUtils::solverTimeout()
     m_SolverTimer.stop();
 
     disconnect(m_StellarSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone);
+    if (m_HedgeSolver)
+        disconnect(m_HedgeSolver.get(), &StellarSolver::finished, this, &SolverUtils::solverDone);
+
+    m_HedgeActive = false;
     abort();
 
     FITSImage::Solution empty;
@@ -223,18 +329,32 @@ void SolverUtils::solverTimeout()
     m_TemporaryFilename.clear();
 }
 
-// We don't trust StellarSolver's multi-processing algorithm MULTI_DEPTHS which is used
-// with multiAlgorithm==MULTI_AUTO && use_scale && !use_position. Force MULTI_SCALES
-// unconditionally so all hint combinations benefit from parallel solving.
+int SolverUtils::resolveMultiAlgorithm(StellarSolver *solver)
+{
+    if (s_MultiAlgorithmOverride >= 0)
+        return s_MultiAlgorithmOverride;
+
+    if (!solver)
+        return MULTI_HEDGE;
+
+    auto algo = solver->getCurrentParameters().multiAlgorithm;
+    if (algo == MULTI_AUTO || algo == MULTI_DEPTHS)
+        return MULTI_HEDGE;
+
+    return algo;
+}
+
+// Legacy entry point -- kept for callers outside SolverUtils.
 void SolverUtils::patchMultiAlgorithm(StellarSolver *solver)
 {
     if (!solver)
         return;
 
+    int algo = resolveMultiAlgorithm(solver);
+    if (algo == MULTI_HEDGE)
+        algo = MULTI_SCALES;
+
     auto params = solver->getCurrentParameters();
-    if (params.multiAlgorithm == MULTI_AUTO || params.multiAlgorithm == MULTI_DEPTHS)
-    {
-        params.multiAlgorithm = MULTI_SCALES;
-        solver->setParameters(params);
-    }
+    params.multiAlgorithm = static_cast<SSolver::MultiAlgo>(algo);
+    solver->setParameters(params);
 }

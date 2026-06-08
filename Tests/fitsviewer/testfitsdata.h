@@ -55,7 +55,11 @@ class TestFitsData : public QObject
         void testBahtinovFocusHFR();
 
         void testParallelSolvers();
+        void testParallelSolversMultiScales();
+        void testParallelSolversMultiDepths();
+        void testHedgeSolver();
     private:
+        void runParallelSolvers(int multiAlgoOverride);
         void startGuideDetect(const QString &filename);
         void guideLoadFinished();
         void guideDetectFinished();
