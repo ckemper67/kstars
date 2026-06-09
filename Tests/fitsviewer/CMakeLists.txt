@@ -24,4 +24,7 @@ ADD_CUSTOM_COMMAND( TARGET testfitsdata POST_BUILD
 ADD_TEST( NAME FitsDataTest COMMAND testfitsdata )
 SET_TESTS_PROPERTIES( FitsDataTest PROPERTIES LABELS "stable")
 
+ADD_EXECUTABLE( render_starfield render_starfield_main.cpp starfieldrenderer.cpp )
+TARGET_INCLUDE_DIRECTORIES( render_starfield PRIVATE ${CFITSIO_INCLUDE_DIR} )
+TARGET_LINK_LIBRARIES( render_starfield Qt${QT_MAJOR_VERSION}::Core ${CFITSIO_LIBRARIES} )
 endif()
