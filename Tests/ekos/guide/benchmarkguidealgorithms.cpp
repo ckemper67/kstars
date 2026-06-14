@@ -1214,7 +1214,7 @@ static void runComplianceScenario(const char *title,
         // compliant 2-mass scenarios with a heavy motor this is wrong by
         // orders of magnitude. Without declareCompliance the controller
         // keeps its rigid pure-integrator approximation -- which is what
-        // H7/H8/H16 relied on before the compliance routing was added; their
+        // WG7/WG8/WG16 relied on before the compliance routing was added; their
         // 5-state flexible matrices are numerically unstable under
         // 2nd-order Taylor discretization (Ks/Jm ratio too large at dt=2s).
         if (declareCompliance)
@@ -1234,11 +1234,11 @@ static void runComplianceScenario(const char *title,
         // inertia; feeding those into MPCGuider builds the matching 5-state
         // flexible plant instead of the rigid pure-integrator. Without this
         // declaration, the controller assumes rigid coupling and issues
-        // catastrophically large corrections on stiff systems (H17
+        // catastrophically large corrections on stiff systems (WG17
         // specifically). The opt-in is required because the existing
         // 2nd-order Taylor discretization in TelescopePlant is unstable for
         // Ks/Jm >> 1/dt^2 (typical worm-drive ratios with the default light
-        // motor); H17 stays just inside the stability envelope because of
+        // motor); WG17 stays just inside the stability envelope because of
         // its heavy direct-drive motor.
         if (declareCompliance && sim.Ks > 0.0 && sim.Ja > 0.0)
             g.setMechanicalParams(sim.Ks, sim.Bs, sim.Ja);
@@ -1345,7 +1345,7 @@ static void runScenario(const char *title,
     }
 }
 
-// H5: step disturbance scenario.
+// WG5: step disturbance scenario.
 // Single step at stepFrame. Reports 3 windows:
 //   Pre-step  : frames 0..stepFrame-1
 //   Immediate : frames stepFrame..stepFrame+nWindow-1   (first response)
@@ -1380,7 +1380,7 @@ static void runH5Scenario(const char *title,
                r.algo.c_str(), preRMS, immRMS, lateRMS);
     };
 
-    // For H5-style scenarios we sweep on the "Late recovery" segment RMS,
+    // For WG5-style scenarios we sweep on the "Late recovery" segment RMS,
     // since that captures settled performance after the step disturbance.
     auto lateRMSof = [&](const Stats &r) {
         return segRMS(r.allPositions, frames - nWindow, frames);
@@ -1796,7 +1796,7 @@ int main(int argc, char *argv[])
         printf("All RMS:   corrected residual, all frames (includes learning transient)\n");
         printf("Final RMS: corrected residual, last quarter (algorithm should have converged)\n");
         printf("Reduction: (1 - Final/Open) x 100%%\n");
-        printf("DeTrend:   final-quarter RMS after removing linear drift (H6 only)\n");
+        printf("DeTrend:   final-quarter RMS after removing linear drift (WG6 only)\n");
         printf("(Pass --tune to run per-scenario parameter sweeps for each algorithm.)\n");
     }
 
@@ -1834,54 +1834,54 @@ int main(int argc, char *argv[])
     // performance after learning. All RMS includes the learning transient.
     // -----------------------------------------------------------------------
 
-    printf("\n\n--- Harmonic Drive Scenarios ---\n");
+    printf("\n\n--- Worm-Gear Mount Scenarios ---\n");
     printf("GPG: compute_period=ON, initial period differs from true period.\n");
     printf("Use Final RMS (last quarter) as the settled performance metric.\n");
 
-    // H1: Classic multi-harmonic, clean
+    // WG1: Classic multi-harmonic, clean
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
         runHarmonicScenario(
-            "H1: Harmonic PE  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  frames=400 (26 periods)  noise=0.10\"\n"
+            "WG1: Harmonic PE  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  frames=400 (26 periods)  noise=0.10\"\n"
             "    [clean multi-harmonic; GPG periodic kernel only covers fundamental]",
             400, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
-    // H2: Non-stationary amplitude (amplitude modulated by 10-min envelope)
+    // WG2: Non-stationary amplitude (amplitude modulated by 10-min envelope)
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.5; pe.A3 = 0.8;
         pe.modT = 600.0; pe.modDepth = 0.5;
         runHarmonicScenario(
-            "H2: Non-stationary PE  T=30s  amplitude x(1+0.5*sin(t/600s))  frames=600  noise=0.15\"\n"
+            "WG2: Non-stationary PE  T=30s  amplitude x(1+0.5*sin(t/600s))  frames=600  noise=0.15\"\n"
             "    [amplitude modulation breaks GP stationarity; linear regression adapts locally]",
             600, 2.0, 0.0, pe, 0.15, 100.0);
     }
 
-    // H3: Stochastic non-repeatable component (OU process overlaid on harmonics)
+    // WG3: Stochastic non-repeatable component (OU process overlaid on harmonics)
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.2; pe.A3 = 0.6;
         pe.ouTau = 15.0; pe.ouSigSS = 1.0;
         runHarmonicScenario(
-            "H3: Stochastic PE  T=30s  + OU(tau=15s, sigma=1.0\")  frames=400  noise=0.20\"\n"
+            "WG3: Stochastic PE  T=30s  + OU(tau=15s, sigma=1.0\")  frames=400  noise=0.20\"\n"
             "    [non-repeatable component; all algorithms converge toward same ceiling]",
             400, 2.0, 0.0, pe, 0.20, 100.0);
     }
 
-    // H4: Directional flex-spline hysteresis
+    // WG4: Directional flex-spline hysteresis
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
         pe.hystLag = 0.5;
         runHarmonicScenario(
-            "H4: Hysteresis lag  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  hystLag=0.5\"  frames=300  noise=0.15\"\n"
+            "WG4: Hysteresis lag  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  hystLag=0.5\"  frames=300  noise=0.15\"\n"
             "    [sign discontinuity at each direction reversal; smooth GP kernels over-smooth]",
             300, 2.0, 0.0, pe, 0.15, 100.0);
     }
 
-    // H5: Step disturbance -- single large step at start of last quarter.
+    // WG5: Step disturbance -- single large step at start of last quarter.
     // 500 frames (2000s): GPG learns T=480s in first 375 frames, then step hits.
     // Pre-step = baseline PE correction quality.
     // Immediate (fr375-399) = first 100s of recovery.
@@ -1890,22 +1890,22 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 480.0; pe.A1 = 5.0;
         runH5Scenario(
-            "H5: Step disturbance  T=480s  A=5.0\"  step=+5.0\" at fr375 (t=1500s)  frames=500  noise=0.20\"\n"
+            "WG5: Step disturbance  T=480s  A=5.0\"  step=+5.0\" at fr375 (t=1500s)  frames=500  noise=0.20\"\n"
             "    [GPG has 375 frames to learn period before step; Immediate/Late show recovery speed]",
             500, 4.0, pe, 0.20, 200.0, 375, +5.0);
     }
 
-    // H6: Combined drift + harmonics -- with detrended final RMS
+    // WG6: Combined drift + harmonics -- with detrended final RMS
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 3.5; pe.A2 = 1.4; pe.A3 = 0.7;
         runHarmonicScenario(
-            "H6: Drift + harmonics  drift=0.05\"/frame  T=30s  A1=3.5\" A2=1.4\" A3=0.7\"  frames=600  noise=0.25\"\n"
+            "WG6: Drift + harmonics  drift=0.05\"/frame  T=30s  A1=3.5\" A2=1.4\" A3=0.7\"  frames=600  noise=0.25\"\n"
             "    [DeTrend removes linear drift component so harmonic correction is visible]",
             600, 2.0, 0.05, pe, 0.25, 100.0, true);
     }
 
-    // H7: Torsional Compliance & Resonance
+    // WG7: Torsional Compliance & Resonance
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
@@ -1915,12 +1915,12 @@ int main(int argc, char *argv[])
         sim.stiction = 0.0; // Clean compliance
         sim.coulomb = 0.0;
         runComplianceScenario(
-            "H7: Torsional Compliance & Resonance  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=250.0  Bs=2.0\n"
+            "WG7: Torsional Compliance & Resonance  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=250.0  Bs=2.0\n"
             "    [Simulates torsional wind-up & resonant mount vibrations; MPC cancels pre-emptively]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
-    // H8: Static Friction + Compliance Wind-Up
+    // WG8: Static Friction + Compliance Wind-Up
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
@@ -1930,22 +1930,22 @@ int main(int argc, char *argv[])
         sim.stiction = 1.5; // High stiction
         sim.coulomb = 0.5;   // High Coulomb friction
         runComplianceScenario(
-            "H8: Static Friction + Compliance Wind-Up  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=200  stiction=1.5Nm\n"
+            "WG8: Static Friction + Compliance Wind-Up  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=200  stiction=1.5Nm\n"
             "    [Simulates stiction stick-slip / deadband play; MPC deadband punch-through suppresses wind-up]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
-    // H9: Fully Adaptive PE Learning
+    // WG9: Fully Adaptive PE Learning
     {
         PEParams pe;
         pe.T = 40.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8; // Unknown frequency T=40s
         runHarmonicScenario(
-            "H9: Fully Adaptive PE Learning  T=40s  A1=4.0\" A2=1.6\" A3=0.8\"  (Unknown period)\n"
+            "WG9: Fully Adaptive PE Learning  T=40s  A1=4.0\" A2=1.6\" A3=0.8\"  (Unknown period)\n"
             "    [Verifies active frequency estimator converges to unknown period T=40s and schedules IMP cancellation]",
             500, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
-    // H10: Sawtooth PE -- worm with slow drift, fast snap-back
+    // WG10: Sawtooth PE -- worm with slow drift, fast snap-back
     // Real worms with single-tooth-pitch error look like sawtooth: linear
     // build-up then sharp return at the tooth-engagement transition.
     // FFT picks up the fundamental at T plus a Fourier comb 2T, 3T, ...;
@@ -1954,24 +1954,24 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_SAWTOOTH;
         runHarmonicScenario(
-            "H10: Sawtooth PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "WG10: Sawtooth PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
             "    [non-sinusoidal worm error; harmonic-rich spectrum tests how many modes IMP captures]",
             400, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
-    // H11: Triangle PE -- constant-velocity reversals
+    // WG11: Triangle PE -- constant-velocity reversals
     // Common in mounts with friction-limited motor velocity; the worm tracks
     // linearly then reverses cleanly. Discontinuity in velocity (not position).
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_TRIANGLE;
         runHarmonicScenario(
-            "H11: Triangle PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "WG11: Triangle PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
             "    [constant-velocity ramps with mid-period sign reversal; tests transient response at direction change]",
             400, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
-    // H12: Half-rectified PE -- single-sided drive train error
+    // WG12: Half-rectified PE -- single-sided drive train error
     // Half-period zero, half-period sine. Strong DC + harmonic content. The
     // MPC's IMP, which models pure sinusoidal d1/d2, cannot match the DC
     // component without help from the motor state.
@@ -1979,14 +1979,14 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_HALFRECT;
         runHarmonicScenario(
-            "H12: Half-rectified PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
+            "WG12: Half-rectified PE  T=30s  A=4.0\"  frames=400  noise=0.10\"\n"
             "    [single-sided worm-tooth error; large DC bias plus harmonic spectrum]",
             400, 2.0, 0.0, pe, 0.10, 100.0);
     }
 
-    // H13: True backlash (direction-dependent deadband)
+    // WG13: True backlash (direction-dependent deadband)
     // Worm-and-wheel gear play: when motor reverses, axis stays put until
-    // the +/- backlash gap is traversed. Different from H4's hysteresis lag
+    // the +/- backlash gap is traversed. Different from WG4's hysteresis lag
     // (which is a signed force offset). MPCSolver has a backlash punch-through
     // path that triggers on commanded direction changes -- this scenario tests
     // it. Compliance is mild (Ks=400) so the backlash effect is isolated.
@@ -1994,18 +1994,18 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
         Sim2MassParams sim;
-        sim.Ks = 400.0;     // Stiffer than H7/H8 to isolate backlash effect
+        sim.Ks = 400.0;     // Stiffer than WG7/WG8 to isolate backlash effect
         sim.Bs = 4.0;       // More damped
         sim.stiction = 0.0; // No stiction
         sim.coulomb = 0.0;
         sim.backlash = 1.0; // 1 arcsec of gear play (typical for hobby mounts)
         runComplianceScenario(
-            "H13: True backlash  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=400.0  backlash=1.0\"\n"
+            "WG13: True backlash  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=400.0  backlash=1.0\"\n"
             "    [direction-dependent deadband at each PE zero-crossing; exercises punch-through compensation]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
-    // H14: Period drift -- worm period changes slowly over the run
+    // WG14: Period drift -- worm period changes slowly over the run
     // Real harmonic-drive/worm-gear mounts drift in period with temperature.
     // ~1-5% per hour is typical. Test uses 10% drift over the run to make
     // adaptation visible. MPC's FFT updates every 10 frames; GPG runs
@@ -2016,12 +2016,12 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 30.0; pe.Tdot = 0.0025; pe.A1 = 4.0;
         runHarmonicScenario(
-            "H14: Period drift  T0=30s -> ~33s over 600 frames  A=4.0\"  noise=0.10\"\n"
+            "WG14: Period drift  T0=30s -> ~33s over 600 frames  A=4.0\"  noise=0.10\"\n"
             "    [worm period drifts 10% over the run; tests FFT (MPC) vs gradient (GPG) re-tracking]",
             600, 2.0, 0.0, pe, 0.10, 30.0);
     }
 
-    // H15: Mid-run plant change -- step disturbance at frame 200 on top of
+    // WG15: Mid-run plant change -- step disturbance at frame 200 on top of
     // ongoing PE. Simulates focus shift, refraction change, or worm contact
     // zone change. Tests adaptive recovery: pre-step settled performance vs
     // post-step transient.
@@ -2029,15 +2029,15 @@ int main(int argc, char *argv[])
         PEParams pe;
         pe.T = 30.0; pe.A1 = 5.0;
         runH5Scenario(
-            "H15: Mid-run amplitude step  T=30s  A1=5.0\"  +3\" step at fr200\n"
+            "WG15: Mid-run amplitude step  T=30s  A1=5.0\"  +3\" step at fr200\n"
             "    [adaptive recovery test: sudden plant change requiring re-learning]",
             400, 2.0, pe, 0.10, 30.0, 200, +3.0);
     }
 
-    // H16: Slow worm PE + backlash. Long worm period (T=480s) means current_u
+    // WG16: Slow worm PE + backlash. Long worm period (T=480s) means current_u
     // reverses only ~once per ~60 frames. The smarter punch-through trigger
     // requires kPunchSustained=30 frames of sustained direction before firing,
-    // so it stays dormant on H13's fast PE (T=30s, reversal every ~7 frames)
+    // so it stays dormant on WG13's fast PE (T=30s, reversal every ~7 frames)
     // but engages here where actual backlash-gap traversal happens.
     {
         PEParams pe;
@@ -2049,7 +2049,7 @@ int main(int argc, char *argv[])
         sim.coulomb = 0.0;
         sim.backlash = 1.0;
         runComplianceScenario(
-            "H16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
+            "WG16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
             "    [long-period PE so sustained direction holds; punch-through engages on each true reversal;\n"
             "     MPC opts in to compliance declaration -> 5-state flexible plant]",
             360, 4.0, 0.0, pe, 0.10, 480.0, sim,
@@ -2057,11 +2057,11 @@ int main(int argc, char *argv[])
             /*declareCompliance=*/true);
     }
 
-    // H17: Slow-response motor + larger backlash. Models a direct-drive or
+    // WG17: Slow-response motor + larger backlash. Models a direct-drive or
     // low-reduction mount where the motor itself has significant inertia
     // (Jm=0.5 vs the default 0.02 -> ~25x heavier). Motor time constant
     // tau = Jm/Bf = 0.5/0.05 = 10s -> several frames at dt=4s to settle.
-    // Backlash=2" is double H16 to make gap traversal a multi-frame event.
+    // Backlash=2" is double WG16 to make gap traversal a multi-frame event.
     // This is the scenario where backlash punch-through should actually help:
     // the motor takes time to cross the gap, so pre-positioning it via
     // punch-through is a real benefit.
@@ -2077,7 +2077,7 @@ int main(int argc, char *argv[])
         sim.coulomb = 0.0;
         sim.backlash = 2.0; // Larger gap
         runComplianceScenario(
-            "H17: Slow-response motor + backlash  T=480s  A=5.0\"  Jm=0.5  backlash=2.0\"\n"
+            "WG17: Slow-response motor + backlash  T=480s  A=5.0\"  Jm=0.5  backlash=2.0\"\n"
             "    [direct-drive style mount: motor takes several frames to settle;\n"
             "     gap traversal is a multi-frame event where punch-through should help;\n"
             "     MPC opts in to compliance declaration -> 5-state flexible plant]",
@@ -2090,7 +2090,7 @@ int main(int argc, char *argv[])
     //
     // A real direct-drive mount has no gearbox, no backlash, no torsional
     // compliance -- the motor is the axis. The 2-mass scenarios above
-    // (including H17) cannot model this faithfully. These scenarios use a
+    // (including WG17) cannot model this faithfully. These scenarios use a
     // dedicated single-state plant with a closed inner velocity servo;
     // cogging is injected as a rate disturbance (physically a torque, the
     // servo integrates it to position), wind as an OU rate disturbance.
@@ -2282,7 +2282,7 @@ int main(int argc, char *argv[])
 
     // B1: Clean belt-drive. Long worm PE through a soft belt coupling.
     // Tests how each algorithm handles a softer plant than worm-gear at
-    // the same PE signature. Compare with H6 (long worm PE, stiff plant).
+    // the same PE signature. Compare with WG6 (long worm PE, stiff plant).
     {
         PEParams pe;
         pe.T = 480.0; pe.A1 = 5.0;
@@ -2294,7 +2294,7 @@ int main(int argc, char *argv[])
         sim.coulomb = 0.2;
         runComplianceScenario(
             "B1: Clean belt drive  T=480s  A=5.0\"  Ks=80 Bs=8 (soft belt)  noise=0.10\"\n"
-            "    [worm PE through a soft belt coupling; tests algorithms against softer plant than H6]",
+            "    [worm PE through a soft belt coupling; tests algorithms against softer plant than WG6]",
             360, 4.0, 0.0, pe, 0.10, 480.0, sim,
             /*gpgLearn=*/true,
             /*declareCompliance=*/false);
@@ -2321,7 +2321,7 @@ int main(int argc, char *argv[])
 
     // B3: Belt + slip event. A single mid-run step disturbance models a
     // brief belt slip or tensioner give. Tests step recovery on a soft
-    // plant; compare with H4 (worm-gear mid-run step).
+    // plant; compare with WG5 (worm-gear mid-run step).
     //
     // runComplianceScenario does not accept a Steps argument, so B3 is
     // wired inline using runCL2Mass / runCLGPG2Mass directly to inject the
@@ -2339,7 +2339,7 @@ int main(int argc, char *argv[])
 
         const char *title =
             "B3: Belt + slip event  T=480s  A=5.0\"  +2.5\" slip at fr180  Ks=80 Bs=8  noise=0.10\"\n"
-            "    [soft belt plant with mid-run slip step; tests step recovery vs H4 (stiff-plant step)]";
+            "    [soft belt plant with mid-run slip step; tests step recovery vs WG5 (stiff-plant step)]";
         const uint32_t SEED = 42;
         {
             LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
