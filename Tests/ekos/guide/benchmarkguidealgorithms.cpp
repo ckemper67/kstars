@@ -813,6 +813,304 @@ static Stats runCLGPGDirectDrive(const std::string &name,
     return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
 }
 
+// ---------------------------------------------------------------------------
+// Strain-Wave (Harmonic Drive) Mount Simulation
+// ---------------------------------------------------------------------------
+//
+// Models a strain-wave drive mount: ZWO HEM/AM3/AM5, iOptron HEM, etc.
+// Three SW-specific features that the 2-mass model gets wrong:
+//
+//   1. Kinematic error (KE) is motor-angle-indexed, not time-indexed. The
+//      wave generator is a 2-lobe elliptical cam so the dominant KE is at
+//      2x per motor revolution. T_KE_seconds below is a *calibration at
+//      sidereal rate*, NOT a wall-clock period. During dithers/large
+//      corrections, KE phase advances proportionally to motor travel; if
+//      you replace this with a t-based PE the dither behavior breaks
+//      silently.
+//   2. Torsional stiffness is torque-dependent (soft-zone). Low stiffness
+//      near zero load, high stiffness under load -- visible in real guide
+//      logs as "stiffens after a few corrections."
+//   3. Hysteresis is rate-independent at direction reversals (Dahl-style
+//      one-state model). Captures the torque-vs-angle loop that a
+//      first-order time lag would miss.
+//
+// No deadband backlash -- real SW drives are near-zero-backlash by design.
+// Tooth-skip is modeled via the existing Steps mechanism if needed.
+
+struct SimStrainWaveParams {
+    // Motor + axis (rigid motor side; axis carries the compliance / hysteresis):
+    double Jm = 0.02;
+    double Ja = 0.5;
+    double Bf = 0.1;
+    double Ba = 0.1;
+    double Kt = 1.0;
+    double stiction = 0.5;     // preload friction is meaningful in SW drives
+    double coulomb = 0.2;
+
+    // KE: motor-angle-indexed. T_KE is calibration at sidereal rate (see
+    // file-header comment). KE_arcsec_per_motor_rev is what determines the
+    // angle-to-phase scaling; we set it so a full KE cycle at sidereal rate
+    // (15.04 arcsec/s) takes T_KE seconds.
+    double T_KE = 60.0;        // s, KE period as seen at sidereal rate
+    double A0 = 0.0;           // arcsec, bearing-eccentricity sub-harmonic
+    int    N_bearing = 30;     // bearing-eccentricity period (motor revs)
+    double A1 = 3.0;           // arcsec, fundamental at 2x motor rev
+    double A2 = 0.8;           // arcsec, 4x motor rev
+    double A3 = 0.2;           // arcsec, 6x motor rev
+    double phi2 = 0.0;
+    double phi3 = 0.0;
+
+    // Soft-zone torque-dependent stiffness:
+    double Ks_low  = 50.0;
+    double Ks_high = 800.0;
+    double T_knee  = 1.0;
+    double Bs      = 4.0;
+
+    // Dahl hysteresis (one state):
+    double h_max = 0.2;        // arcsec, saturation displacement
+    double Kh    = 10.0;       // torque-domain gain on h
+};
+
+// Motor-angle-indexed kinematic error. phi is the wave-generator angle in
+// radians (theta_m mapped to motor-rev phase). Sidereal-rate calibration:
+// at constant sidereal motion (15.04 arcsec/s) one motor rev takes
+// T_KE seconds of guiding time, so KE_arcsec_per_motor_rev = 15.04 * T_KE.
+static inline double swKE(const SimStrainWaveParams &sw, double theta_m_arcsec)
+{
+    constexpr double SIDEREAL = 15.04108; // arcsec/s
+    const double KE_arcsec_per_motor_rev = SIDEREAL * sw.T_KE;
+    if (KE_arcsec_per_motor_rev <= 0.0) return 0.0;
+    const double phi = 2.0 * M_PI * theta_m_arcsec / KE_arcsec_per_motor_rev;
+    double v = sw.A1 * std::sin(2.0 * phi)
+             + sw.A2 * std::sin(4.0 * phi + sw.phi2)
+             + sw.A3 * std::sin(6.0 * phi + sw.phi3);
+    if (sw.A0 > 0.0 && sw.N_bearing > 0)
+        v += sw.A0 * std::sin(phi / static_cast<double>(sw.N_bearing));
+    return v;
+}
+
+// Torque-dependent stiffness (lagged by one micro-step to avoid an implicit
+// solve; one-step phase error is benign because tanh saturates slowly).
+static inline double swKsEff(const SimStrainWaveParams &sw, double T_prev)
+{
+    const double t = std::abs(T_prev) / std::max(sw.T_knee, 1e-9);
+    return sw.Ks_low + (sw.Ks_high - sw.Ks_low) * std::tanh(t);
+}
+
+// Dahl hysteresis update. Drives h toward sign(d_theta) * h_max with rate
+// proportional to |d_theta|; rate-independent, saturates at +/-h_max.
+static inline void swDahlUpdate(double &h, double d_theta, double h_max)
+{
+    if (h_max <= 0.0 || d_theta == 0.0) return;
+    const double s = (d_theta > 0.0) ? 1.0 : -1.0;
+    h += (h_max - s * h) * s * std::abs(d_theta) / h_max;
+    if (h >  h_max) h =  h_max;
+    if (h < -h_max) h = -h_max;
+}
+
+template <typename Guider>
+static Stats runCLStrainWave(const std::string &name, Guider &g,
+                             int frames, double exposure,
+                             double driftPerFrame,
+                             double noiseSigma, uint32_t seed,
+                             const SimStrainWaveParams &sw,
+                             const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed;
+    double theta_m = 0.0;
+    double omega_m = 0.0;
+    double theta_a = 0.0;
+    double omega_a = 0.0;
+    double h_dahl  = 0.0;
+    double T_prev  = 0.0;
+    double open_pos = 0.0;
+
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    const double h_dt = 0.002;
+    const int stepsPerFrame = static_cast<int>(exposure / h_dt);
+
+    // Motor advances at sidereal even when residuals are near zero. KE is
+    // indexed against absolute motor angle: motor_abs = i*sidereal*exposure
+    // + theta_m (residual). The residual contribution is small vs sidereal
+    // (~1" vs ~60"/frame at 4s exposure) so the within-frame variation of
+    // motor_abs is dominated by sidereal; we use the frame-start value as
+    // the KE phase for the whole inner loop (KE cycles cleanly).
+    constexpr double SIDEREAL = 15.04108;  // arcsec/s
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) { theta_a += delta; open_pos += delta; }
+
+        theta_a += driftPerFrame;
+        theta_m += driftPerFrame;
+        open_pos += driftPerFrame;
+
+        // Absolute motor angle for KE indexing: sidereal accumulation +
+        // closed-loop residual. open_motor is the uncorrected analogue.
+        const double motor_abs  = i * SIDEREAL * exposure + theta_m;
+        const double open_motor = i * SIDEREAL * exposure;
+        const double frame_KE = swKE(sw, motor_abs);
+        // Open-loop reference: an uncorrected mount would lag the motor by
+        // KE(open_motor); residual axis = -KE(open_motor). Drift adds on top.
+        const double open_residual = open_pos - swKE(sw, open_motor);
+        sqOpen += open_residual * open_residual;
+
+        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double corr = g.guide(meas);
+        theta_m -= corr;
+
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            const double rel_pos = theta_m - theta_a + frame_KE;
+            const double rel_vel = omega_m - omega_a;
+            const double Ks_eff = swKsEff(sw, T_prev);
+            const double T_spring = Ks_eff * rel_pos + sw.Bs * rel_vel;
+            const double T_total  = T_spring + sw.Kh * h_dahl;
+
+            // Motor side: rigid, low friction.
+            const double omega_m_dot = (-sw.Bf * omega_m - T_total) / sw.Jm;
+            theta_m += h_dt * omega_m;
+            omega_m += h_dt * omega_m_dot;
+
+            // Axis side with stiction/Coulomb (preload friction matters in SW):
+            double T_friction = 0.0;
+            if (std::abs(omega_a) < 1e-4) {
+                if (std::abs(T_total) < sw.stiction) {
+                    T_friction = T_total;
+                    omega_a = 0.0;
+                } else {
+                    T_friction = sw.coulomb * (T_total > 0.0 ? 1.0 : -1.0);
+                }
+            } else {
+                T_friction = sw.coulomb * (omega_a > 0.0 ? 1.0 : -1.0);
+            }
+
+            const double omega_a_dot = (T_total - sw.Ba * omega_a - T_friction) / sw.Ja;
+            const double d_theta_a = h_dt * omega_a;
+            theta_a += d_theta_a;
+            omega_a += h_dt * omega_a_dot;
+
+            // Dahl hysteresis driven by axis-side displacement (the side
+            // that flexes against load).
+            swDahlUpdate(h_dahl, d_theta_a, sw.h_max);
+
+            T_prev = T_spring;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    const double oRMS = std::sqrt(sqOpen / frames);
+    const double aRMS = std::sqrt(sqAll  / frames);
+    const double fRMS = std::sqrt(sqFinal / nFinal);
+    const double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
+static Stats runCLGPGStrainWave(const std::string &name,
+                                GaussianProcessGuider &gpg,
+                                int frames, double exposure,
+                                double driftPerFrame,
+                                double noiseSigma, uint32_t seed,
+                                const SimStrainWaveParams &sw,
+                                const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed;
+    double theta_m = 0.0;
+    double omega_m = 0.0;
+    double theta_a = 0.0;
+    double omega_a = 0.0;
+    double h_dahl  = 0.0;
+    double T_prev  = 0.0;
+    double open_pos = 0.0;
+
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    const double h_dt = 0.002;
+    const int stepsPerFrame = static_cast<int>(exposure / h_dt);
+
+    // See runCLStrainWave for sidereal-indexing rationale.
+    constexpr double SIDEREAL = 15.04108;
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) { theta_a += delta; open_pos += delta; }
+
+        theta_a += driftPerFrame;
+        theta_m += driftPerFrame;
+        open_pos += driftPerFrame;
+
+        const double motor_abs  = i * SIDEREAL * exposure + theta_m;
+        const double open_motor = i * SIDEREAL * exposure;
+        const double frame_KE = swKE(sw, motor_abs);
+        const double open_residual = open_pos - swKE(sw, open_motor);
+        sqOpen += open_residual * open_residual;
+
+        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double corr = gpg.result(meas, 100.0, exposure);
+        theta_m -= corr;
+
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            const double rel_pos = theta_m - theta_a + frame_KE;
+            const double rel_vel = omega_m - omega_a;
+            const double Ks_eff = swKsEff(sw, T_prev);
+            const double T_spring = Ks_eff * rel_pos + sw.Bs * rel_vel;
+            const double T_total  = T_spring + sw.Kh * h_dahl;
+
+            const double omega_m_dot = (-sw.Bf * omega_m - T_total) / sw.Jm;
+            theta_m += h_dt * omega_m;
+            omega_m += h_dt * omega_m_dot;
+
+            double T_friction = 0.0;
+            if (std::abs(omega_a) < 1e-4) {
+                if (std::abs(T_total) < sw.stiction) {
+                    T_friction = T_total;
+                    omega_a = 0.0;
+                } else {
+                    T_friction = sw.coulomb * (T_total > 0.0 ? 1.0 : -1.0);
+                }
+            } else {
+                T_friction = sw.coulomb * (omega_a > 0.0 ? 1.0 : -1.0);
+            }
+
+            const double omega_a_dot = (T_total - sw.Ba * omega_a - T_friction) / sw.Ja;
+            const double d_theta_a = h_dt * omega_a;
+            theta_a += d_theta_a;
+            omega_a += h_dt * omega_a_dot;
+
+            swDahlUpdate(h_dahl, d_theta_a, sw.h_max);
+
+            T_prev = T_spring;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    const double oRMS = std::sqrt(sqOpen / frames);
+    const double aRMS = std::sqrt(sqAll  / frames);
+    const double fRMS = std::sqrt(sqFinal / nFinal);
+    const double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
 static void runComplianceScenario(const char *title,
                                   int frames, double exposure,
                                   double driftPerFrame, const PEParams &pe,
@@ -1383,6 +1681,97 @@ static void runDirectDriveScenario(const char *title,
     }
 }
 
+static void runStrainWaveScenario(const char *title,
+                                  int frames, double exposure,
+                                  double driftPerFrame,
+                                  double noiseSigma,
+                                  const SimStrainWaveParams &sw,
+                                  const Steps &steps = {})
+{
+    const uint32_t SEED = 42;
+    // GPG given the KE period at sidereal rate as a learnable period.
+    const double gpgInitPeriod = (sw.T_KE > 0.0) ? sw.T_KE : 100.0;
+
+    if (g_tune)
+    {
+        printTunedHeader(title);
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCLStrainWave("LinearGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCLStrainWave("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printTunedRow("LinearGuider", sDef, sBest, bestP);
+        }
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCLStrainWave("HysteresisGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCLStrainWave("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printTunedRow("HysteresisGuider", sDef, sBest, bestP);
+        }
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgInitPeriod, true));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPGStrainWave("GPG (learn)", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+            Stats sBest = sDef; std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgInitPeriod, true);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPGStrainWave("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printTunedRow("GPG (learn)", sDef, sBest, bestP);
+        }
+        {
+            // No compliance declaration, no backlash. The controller has no
+            // SW-aware plant yet (per-class tuning roadmap); rigid pure-
+            // integrator is the default. Punch-through stays gated off.
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCLStrainWave("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
+        return;
+    }
+
+    {
+        LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+        auto r = runCLStrainWave("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+        printHeader(title);
+        printRow(r);
+    }
+    {
+        HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+        auto r = runCLStrainWave("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+        printRow(r);
+    }
+    {
+        GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, true));
+        gpg.SetLearningRate(1.0);
+        auto r = runCLGPGStrainWave("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+        printRow(r);
+    }
+    {
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+        printRow(r);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1783,6 +2172,94 @@ int main(int argc, char *argv[])
             "DD5: DD + structural mode  mode=6Hz zeta=0.05 A=0.05\"  noise=0.10\"\n"
             "    [under-damped mount resonance aliased into the guide band; nothing should blow up]",
             300, 4.0, 0.0, 0.10, dd);
+    }
+
+    // ----- Strain-Wave (Harmonic Drive) Scenarios -----
+    //
+    // Models strain-wave mounts (ZWO HEM/AM3/AM5, iOptron HEM, etc.). Three
+    // SW-specific features that the 2-mass and DD plants get wrong:
+    //   1. Motor-angle-indexed KE with dominant 2x harmonic
+    //   2. Soft-zone torque-dependent stiffness (Ks_eff = tanh-saturated)
+    //   3. Rate-independent (Dahl) hysteresis at direction reversals
+    // No deadband backlash. MPC configured rigid pure-integrator (per-class
+    // SW tuning is roadmap, not this PR).
+    //
+    // SW1-SW3 each isolate one feature; SW4 combines all three to expose
+    // the soft-zone x hysteresis interaction that none of SW1-SW3 catches.
+    printf("\n\n--- Strain-Wave Drive Scenarios ---\n");
+
+    // SW1: Clean SW. Moderate KE, high enough load that the system sits in
+    // the stiff regime. The 2x-per-motor-rev signature should dominate the
+    // residual; soft-zone and hysteresis stay quiet.
+    {
+        SimStrainWaveParams sw;
+        sw.T_KE = 60.0;
+        sw.A1 = 3.0; sw.A2 = 0.8; sw.A3 = 0.2;
+        sw.A0 = 0.3;  // small bearing-eccentricity sub-harmonic
+        sw.h_max = 0.02;  // tiny: keep hysteresis dormant in SW1
+        sw.Kh = 10.0;
+        runStrainWaveScenario(
+            "SW1: Clean SW  T_KE=60s  A1=3.0\" A2=0.8\" A3=0.2\" A0=0.3\"  noise=0.10\"\n"
+            "    [stiff regime; 2x-per-motor-rev KE signature dominates residual]",
+            300, 4.0, 0.0, 0.10, sw);
+    }
+
+    // SW2: Soft-zone exposed. Small KE so spring torque stays low and the
+    // stiffness sits near Ks_low. Any guider expecting Ks_high will
+    // overshoot. Short exposures / low noise expose this most.
+    {
+        SimStrainWaveParams sw;
+        sw.T_KE = 60.0;
+        sw.A1 = 0.8; sw.A2 = 0.2; sw.A3 = 0.05;
+        sw.Ks_low = 30.0;     // softer low regime
+        sw.Ks_high = 600.0;
+        sw.T_knee = 1.5;      // higher knee so we stay in soft zone
+        sw.h_max = 0.02;
+        sw.Kh = 10.0;
+        runStrainWaveScenario(
+            "SW2: SW soft-zone exposed  T_KE=60s  A1=0.8\"  Ks_low=30 Ks_high=600 T_knee=1.5  noise=0.05\"\n"
+            "    [low load -> system stays in low-stiffness regime; tests overshoot under reduced Ks]",
+            300, 4.0, 0.0, 0.05, sw);
+    }
+
+    // SW3: Hysteresis exercised. Inject dither steps to force direction
+    // reversals; each one traverses the Dahl loop. Residual should show
+    // step-like offsets at reversal frames, not clean recovery.
+    {
+        SimStrainWaveParams sw;
+        sw.T_KE = 60.0;
+        sw.A1 = 1.0; sw.A2 = 0.3; sw.A3 = 0.1;
+        sw.h_max = 0.3;       // saturation displacement
+        sw.Kh = 12.0;         // hysteresis ~10-30% of spring torque
+        // Dither pattern: 5 reversals at 50-frame intervals
+        Steps dither = {{50, 2.0}, {100, -2.0}, {150, 2.0}, {200, -2.0}, {250, 2.0}};
+        runStrainWaveScenario(
+            "SW3: SW + hysteresis at reversals  T_KE=60s  h_max=0.3\" Kh=12  +/-2\" dithers every 50fr  noise=0.10\"\n"
+            "    [each dither reversal traverses the Dahl loop; expect step-like residual offsets]",
+            300, 4.0, 0.0, 0.10, sw, dither);
+    }
+
+    // SW4: Realistic combined. All three features active simultaneously
+    // at moderate load -- closest analogue to a real session. Specifically
+    // catches the soft-zone x hysteresis interaction: at low load, the
+    // hysteresis offset is a much larger fraction of total restoring
+    // torque, so reversals near zero load behave qualitatively differently
+    // from reversals at high load. SW1-SW3 isolate; SW4 integrates.
+    {
+        SimStrainWaveParams sw;
+        sw.T_KE = 60.0;
+        sw.A1 = 2.0; sw.A2 = 0.5; sw.A3 = 0.15;
+        sw.A0 = 0.2;
+        sw.Ks_low = 40.0;
+        sw.Ks_high = 800.0;
+        sw.T_knee = 1.0;
+        sw.h_max = 0.2;
+        sw.Kh = 10.0;
+        Steps dither = {{75, 1.5}, {150, -1.5}, {225, 1.5}};
+        runStrainWaveScenario(
+            "SW4: Realistic combined SW  KE+soft-zone+hysteresis  dithers at fr75/150/225  noise=0.10\"\n"
+            "    [all three SW features active together; catches soft-zone x hysteresis interaction at reversals]",
+            300, 4.0, 0.0, 0.10, sw, dither);
     }
 
     printf("\n");
