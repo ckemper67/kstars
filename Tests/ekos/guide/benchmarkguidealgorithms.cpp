@@ -2262,6 +2262,109 @@ int main(int argc, char *argv[])
             300, 4.0, 0.0, 0.10, sw, dither);
     }
 
+    // ----- Belt-Drive Scenarios -----
+    //
+    // Belt-driven mounts (Skywatcher belt-mod HEQ5/EQ6, AZ-EQ6, Celestron
+    // CGX-L) couple the motor to the worm shaft (or axis directly) through
+    // a toothed belt. Belt physics = single-stage compliance:
+    //   - Ks ~50-100 (softer than worm-gear; belt is the compliant element)
+    //   - Bs ~5-10 (belt damps more than steel gear teeth)
+    //   - backlash ~0 (pre-tensioned belts)
+    // No SW-style soft-zone, no DD-style servo. Worm PE downstream of the
+    // belt is unchanged, so the existing time-indexed PE applies.
+    //
+    // Belt physics is a parameter regime on the 2-mass plant, not a new
+    // physical model -- so these scenarios reuse runComplianceScenario with
+    // belt-tuned Sim2MassParams rather than duplicating ~400 lines for a
+    // dedicated SimBeltParams. Tandem belt+worm (EQ6 belt-mod) is a 3-mass
+    // problem deferred to a follow-up; see plans/belt-mount-simulator.md.
+    printf("\n\n--- Belt Drive Scenarios ---\n");
+
+    // B1: Clean belt-drive. Long worm PE through a soft belt coupling.
+    // Tests how each algorithm handles a softer plant than worm-gear at
+    // the same PE signature. Compare with H6 (long worm PE, stiff plant).
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 5.0;
+        Sim2MassParams sim;
+        sim.Ks = 80.0;       // belt-soft
+        sim.Bs = 8.0;        // belt-damped
+        sim.backlash = 0.0;  // pre-tensioned
+        sim.stiction = 0.5;
+        sim.coulomb = 0.2;
+        runComplianceScenario(
+            "B1: Clean belt drive  T=480s  A=5.0\"  Ks=80 Bs=8 (soft belt)  noise=0.10\"\n"
+            "    [worm PE through a soft belt coupling; tests algorithms against softer plant than H6]",
+            360, 4.0, 0.0, pe, 0.10, 480.0, sim,
+            /*gpgLearn=*/true,
+            /*declareCompliance=*/false);
+    }
+
+    // B2: Belt + drift. Same belt regime with constant drift added. Tests
+    // drift rejection on a soft plant.
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 5.0;
+        Sim2MassParams sim;
+        sim.Ks = 80.0;
+        sim.Bs = 8.0;
+        sim.backlash = 0.0;
+        sim.stiction = 0.5;
+        sim.coulomb = 0.2;
+        runComplianceScenario(
+            "B2: Belt + drift  T=480s  A=5.0\"  drift=0.05\"/frame  Ks=80 Bs=8  noise=0.10\"\n"
+            "    [soft belt plant with constant drift; tests drift rejection under belt compliance]",
+            360, 4.0, 0.05, pe, 0.10, 480.0, sim,
+            /*gpgLearn=*/true,
+            /*declareCompliance=*/false);
+    }
+
+    // B3: Belt + slip event. A single mid-run step disturbance models a
+    // brief belt slip or tensioner give. Tests step recovery on a soft
+    // plant; compare with H4 (worm-gear mid-run step).
+    //
+    // runComplianceScenario does not accept a Steps argument, so B3 is
+    // wired inline using runCL2Mass / runCLGPG2Mass directly to inject the
+    // step.
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 5.0;
+        Sim2MassParams sim;
+        sim.Ks = 80.0;
+        sim.Bs = 8.0;
+        sim.backlash = 0.0;
+        sim.stiction = 0.5;
+        sim.coulomb = 0.2;
+        Steps slip = {{180, 2.5}};   // single 2.5" slip at mid-run
+
+        const char *title =
+            "B3: Belt + slip event  T=480s  A=5.0\"  +2.5\" slip at fr180  Ks=80 Bs=8  noise=0.10\"\n"
+            "    [soft belt plant with mid-run slip step; tests step recovery vs H4 (stiff-plant step)]";
+        const uint32_t SEED = 42;
+        {
+            LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+            auto r = runCL2Mass("LinearGuider", g, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printHeader(title);
+            printRow(r);
+        }
+        {
+            HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+            auto r = runCL2Mass("HysteresisGuider", g, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printRow(r);
+        }
+        {
+            GaussianProcessGuider gpg(makeGPGParams(480.0, true));
+            gpg.SetLearningRate(1.0);
+            auto r = runCLGPG2Mass("GPG (learn)", gpg, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printRow(r);
+        }
+        {
+            MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            auto r = runCL2Mass("MPCGuider", g, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printRow(r);
+        }
+    }
+
     printf("\n");
     return 0;
 }
