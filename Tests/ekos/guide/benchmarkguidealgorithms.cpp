@@ -593,6 +593,226 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
     return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
 }
 
+// ---------------------------------------------------------------------------
+// Direct-Drive Mount Simulation
+// ---------------------------------------------------------------------------
+//
+// Models a direct-drive (DD) mount: motor rigidly coupled to the axis with
+// no gearbox, so no torsional compliance, no backlash, no worm PE. The
+// dominant disturbances are cogging/torque ripple (a torque, integrated to
+// position by the inner servo), wind gusts (modeled as an Ornstein-Uhlenbeck
+// rate disturbance), and the inner velocity servo's finite tracking
+// bandwidth.
+//
+// State: theta_a (arcsec) and axis_rate (arcsec/s). The guider issues a
+// position pulse interpreted by the inner servo as a commanded rate
+// (rate_cmd = -correction / exposure over the upcoming frame). The actual
+// axis rate slews toward rate_cmd with first-order time constant tau_servo.
+// Cogging enters as a rate disturbance (faithful: cogging is a torque, the
+// servo integrates it to position). Wind enters as a rate disturbance via
+// an OU process.
+
+struct SimDirectDriveParams {
+    // Inner closed-loop velocity servo seen from the guider:
+    double tau_servo = 0.3;     // s, first-order rate-tracking time constant.
+
+    // Cogging / torque ripple, injected as a rate disturbance (arcsec/s).
+    // Period is in seconds (mount-internal, not tied to motor angle here --
+    // the strain-wave follow-up will index by motor angle).
+    double ripple_T  = 30.0;    // s, fundamental period
+    double ripple_A1 = 0.0;     // arcsec/s, fundamental rate amplitude
+    double ripple_A2 = 0.0;     // arcsec/s, 2nd harmonic
+    double ripple_A3 = 0.0;     // arcsec/s, 3rd harmonic
+
+    // Wind / balance, OU rate disturbance:
+    double wind_tau   = 20.0;   // s, OU correlation time
+    double wind_sigma = 0.0;    // arcsec/s, OU steady-state sigma
+
+    // Optional under-damped structural mode (mount/OTA cantilever), aliased
+    // into the band at guide cadence. Off by default.
+    double mode_hz   = 0.0;
+    double mode_zeta = 0.05;
+    double mode_A    = 0.0;     // arcsec, displacement amplitude
+
+    // Inner servo noise floor (arcsec/s rms, added once per micro-step).
+    double servo_noise = 0.0;
+};
+
+static inline double ddRipple(const SimDirectDriveParams &dd, double t)
+{
+    if (dd.ripple_T <= 0.0) return 0.0;
+    const double w = 2.0 * M_PI / dd.ripple_T;
+    return dd.ripple_A1 * std::sin(w * t)
+         + dd.ripple_A2 * std::sin(2.0 * w * t)
+         + dd.ripple_A3 * std::sin(3.0 * w * t);
+}
+
+static inline double ddMode(const SimDirectDriveParams &dd, double t)
+{
+    if (dd.mode_hz <= 0.0 || dd.mode_A <= 0.0) return 0.0;
+    const double w = 2.0 * M_PI * dd.mode_hz;
+    return dd.mode_A * std::exp(-dd.mode_zeta * w * t) * std::sin(w * t);
+}
+
+// OU step: dx/dt = -x/tau + sigma_ss * sqrt(2/tau) * dW
+static inline double ddWindStep(double &x, double tau, double sigma_ss,
+                                double dt, uint32_t &s)
+{
+    if (tau <= 0.0 || sigma_ss <= 0.0) { x = 0.0; return 0.0; }
+    const double a = std::exp(-dt / tau);
+    const double sd = sigma_ss * std::sqrt(1.0 - a * a);
+    x = a * x + sd * (gaussNoise(s, 1.0));
+    return x;
+}
+
+template <typename Guider>
+static Stats runCLDirectDrive(const std::string &name, Guider &g,
+                              int frames, double exposure,
+                              double driftPerFrame,
+                              double noiseSigma, uint32_t seed,
+                              const SimDirectDriveParams &dd,
+                              const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed, sw = seed + 2000000u, sv = seed + 3000000u;
+    double theta_a = 0.0;
+    double axis_rate = 0.0;
+    double wind = 0.0;
+    double open_pos = 0.0;  // disturbance accumulation, no servo correction
+
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    const double h = 0.002;
+    const int stepsPerFrame = static_cast<int>(exposure / h);
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) { theta_a += delta; open_pos += delta; }
+
+        const double t_start = i * exposure;
+        theta_a += driftPerFrame;
+        open_pos += driftPerFrame;
+
+        sqOpen += open_pos * open_pos;
+
+        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double corr = g.guide(meas);
+
+        // Interpret the guider's position pulse as a rate command over the
+        // upcoming frame: rate_cmd = -corr / exposure.
+        const double rate_cmd = -corr / exposure;
+
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            const double current_t = t_start + s * h;
+
+            // Inner servo: first-order rate tracking.
+            const double tau = std::max(dd.tau_servo, 1e-6);
+            axis_rate += (rate_cmd - axis_rate) * (h / tau);
+
+            // Wind OU disturbance (slow rate term).
+            ddWindStep(wind, dd.wind_tau, dd.wind_sigma, h, sw);
+
+            // Cogging ripple, structural mode, servo noise.
+            const double ripple = ddRipple(dd, current_t);
+            const double mode   = ddMode(dd, current_t);
+            const double vnoise = (dd.servo_noise > 0.0)
+                                  ? gaussNoise(sv, dd.servo_noise) : 0.0;
+
+            theta_a += (axis_rate + ripple + wind + mode + vnoise) * h;
+            // Open-loop reference: same disturbances, no servo correction.
+            // Reuses the same wind/noise stream so open and closed see the
+            // same disturbance realization (apples-to-apples reduction).
+            open_pos += (ripple + wind + mode) * h;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    const double oRMS = std::sqrt(sqOpen / frames);
+    const double aRMS = std::sqrt(sqAll  / frames);
+    const double fRMS = std::sqrt(sqFinal / nFinal);
+    const double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
+static Stats runCLGPGDirectDrive(const std::string &name,
+                                 GaussianProcessGuider &gpg,
+                                 int frames, double exposure,
+                                 double driftPerFrame,
+                                 double noiseSigma, uint32_t seed,
+                                 const SimDirectDriveParams &dd,
+                                 const Steps &steps = {}, bool collectAll = false)
+{
+    uint32_t sn = seed, sw = seed + 2000000u, sv = seed + 3000000u;
+    double theta_a = 0.0;
+    double axis_rate = 0.0;
+    double wind = 0.0;
+    double open_pos = 0.0;
+
+    double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
+    int nFinal = std::max(1, frames / 4);
+    std::vector<double> finalPos, allPos;
+    if (collectAll) allPos.reserve(frames);
+
+    const double h = 0.002;
+    const int stepsPerFrame = static_cast<int>(exposure / h);
+
+    for (int i = 0; i < frames; ++i)
+    {
+        for (const auto &[fr, delta] : steps)
+            if (fr == i) { theta_a += delta; open_pos += delta; }
+
+        const double t_start = i * exposure;
+        theta_a += driftPerFrame;
+        open_pos += driftPerFrame;
+
+        sqOpen += open_pos * open_pos;
+
+        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double corr = gpg.result(meas, 100.0, exposure);
+
+        const double rate_cmd = -corr / exposure;
+
+        for (int s = 0; s < stepsPerFrame; ++s) {
+            const double current_t = t_start + s * h;
+
+            const double tau = std::max(dd.tau_servo, 1e-6);
+            axis_rate += (rate_cmd - axis_rate) * (h / tau);
+
+            ddWindStep(wind, dd.wind_tau, dd.wind_sigma, h, sw);
+
+            const double ripple = ddRipple(dd, current_t);
+            const double mode   = ddMode(dd, current_t);
+            const double vnoise = (dd.servo_noise > 0.0)
+                                  ? gaussNoise(sv, dd.servo_noise) : 0.0;
+
+            theta_a += (axis_rate + ripple + wind + mode + vnoise) * h;
+            open_pos += (ripple + wind + mode) * h;
+        }
+
+        sqAll += theta_a * theta_a;
+        if (i >= frames - nFinal) {
+            sqFinal += theta_a * theta_a;
+            finalPos.push_back(theta_a);
+        }
+        if (collectAll) allPos.push_back(theta_a);
+    }
+
+    const double oRMS = std::sqrt(sqOpen / frames);
+    const double aRMS = std::sqrt(sqAll  / frames);
+    const double fRMS = std::sqrt(sqFinal / nFinal);
+    const double red  = oRMS > 0.0 ? (1.0 - fRMS / oRMS) * 100.0 : 0.0;
+    return {name, oRMS, aRMS, fRMS, red, finalPos, allPos};
+}
+
 static void runComplianceScenario(const char *title,
                                   int frames, double exposure,
                                   double driftPerFrame, const PEParams &pe,
@@ -1067,6 +1287,102 @@ static void runHarmonicScenario(const char *title,
     }
 }
 
+static void runDirectDriveScenario(const char *title,
+                                   int frames, double exposure,
+                                   double driftPerFrame,
+                                   double noiseSigma,
+                                   const SimDirectDriveParams &dd,
+                                   const Steps &steps = {})
+{
+    const uint32_t SEED = 42;
+
+    // GPG given a nominal period equal to the ripple period when present,
+    // so it can learn the repeatable cogging component.
+    const double gpgInitPeriod = (dd.ripple_T > 0.0) ? dd.ripple_T : 100.0;
+
+    if (g_tune)
+    {
+        printTunedHeader(title);
+        {
+            LinearGuider gd("RA"); gd.setGain(0.7); gd.setMinMove(0.1); gd.setLength(25);
+            Stats sDef = runCLDirectDrive("LinearGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.7 len=25";
+            for (double gain : kLinearGain) for (int length : kLinearLength) {
+                LinearGuider g("RA"); g.setGain(gain); g.setMinMove(0.1); g.setLength(length);
+                Stats s = runCLDirectDrive("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f len=%d", gain, length); }
+            }
+            printTunedRow("LinearGuider", sDef, sBest, bestP);
+        }
+        {
+            HysteresisGuider gd("RA"); gd.setGain(0.6); gd.setHysteresis(0.1); gd.setMinMove(0.1);
+            Stats sDef = runCLDirectDrive("HysteresisGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+            Stats sBest = sDef; std::string bestP = "gain=0.6 hyst=0.1";
+            for (double gain : kHystGain) for (double hyst : kHystValue) {
+                HysteresisGuider g("RA"); g.setGain(gain); g.setHysteresis(hyst); g.setMinMove(0.1);
+                Stats s = runCLDirectDrive("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("gain=%.1f hyst=%.1f", gain, hyst); }
+            }
+            printTunedRow("HysteresisGuider", sDef, sBest, bestP);
+        }
+        {
+            GaussianProcessGuider gd(makeGPGParams(gpgInitPeriod, true));
+            gd.SetLearningRate(1.0);
+            Stats sDef = runCLGPGDirectDrive("GPG (learn)", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+            Stats sBest = sDef; std::string bestP = "cg=0.8 pkls=10";
+            for (double cg : kGpgCtrlGain) for (double pkls : kGpgPKLengthSc) {
+                auto p = makeGPGParams(gpgInitPeriod, true);
+                p.control_gain_ = cg; p.PKLengthScale_ = pkls;
+                GaussianProcessGuider gpg(p); gpg.SetLearningRate(1.0);
+                Stats s = runCLGPGDirectDrive("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("cg=%.1f pkls=%.0f", cg, pkls); }
+            }
+            printTunedRow("GPG (learn)", sDef, sBest, bestP);
+        }
+        {
+            // DD has no compliance and no backlash: do NOT declare compliance to
+            // MPC and do NOT set backlash. Punch-through stays gated off
+            // (MPCSolver guards on backlash_ > 0.0). The default rigid pure-
+            // integrator plant is the right match for a closed-loop DD servo.
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCLDirectDrive("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
+        return;
+    }
+
+    {
+        LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+        auto r = runCLDirectDrive("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+        printHeader(title);
+        printRow(r);
+    }
+    {
+        HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+        auto r = runCLDirectDrive("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+        printRow(r);
+    }
+    {
+        GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, true));
+        gpg.SetLearningRate(1.0);
+        auto r = runCLGPGDirectDrive("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+        printRow(r);
+    }
+    {
+        // No compliance declaration, no backlash setting -- see tune branch
+        // comment above for why.
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+        printRow(r);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1379,6 +1695,94 @@ int main(int argc, char *argv[])
             360, 4.0, 0.0, pe, 0.10, 480.0, sim,
             /*gpgLearn=*/true,
             /*declareCompliance=*/true);
+    }
+
+    // ----- Direct-Drive Scenarios -----
+    //
+    // A real direct-drive mount has no gearbox, no backlash, no torsional
+    // compliance -- the motor is the axis. The 2-mass scenarios above
+    // (including H17) cannot model this faithfully. These scenarios use a
+    // dedicated single-state plant with a closed inner velocity servo;
+    // cogging is injected as a rate disturbance (physically a torque, the
+    // servo integrates it to position), wind as an OU rate disturbance.
+    // MPCGuider is configured without compliance declaration and without
+    // backlash, so its rigid pure-integrator plant matches the DD servo
+    // and the backlash punch-through stays gated off.
+    printf("\n\n--- Direct Drive Scenarios ---\n");
+
+    // DD1: Clean fast servo + tiny ripple. Easiest scenario in the suite;
+    // all algorithms should track to near the noise floor.
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 0.3;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.02;     // arcsec/s -- ~0.1" peak position-equivalent
+        runDirectDriveScenario(
+            "DD1: Clean DD  tau_servo=0.3s  ripple_T=30s  A1=0.02\"/s  noise=0.10\"\n"
+            "    [fast inner servo + tiny cogging; baseline DD performance]",
+            300, 4.0, 0.0, 0.10, dd);
+    }
+
+    // DD2: Cogging harmonics. Fundamental + 2nd/3rd at a short period
+    // (well above the per-frame Nyquist for repeatability). Tests how each
+    // algorithm handles a fast repeatable disturbance very different from
+    // a 480s worm period.
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 0.3;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.08;
+        dd.ripple_A2 = 0.03;
+        dd.ripple_A3 = 0.015;
+        runDirectDriveScenario(
+            "DD2: DD + cogging harmonics  ripple_T=30s  A1=0.08 A2=0.03 A3=0.015\"/s  noise=0.10\"\n"
+            "    [repeatable torque ripple with 2nd/3rd harmonics; GPG should learn it]",
+            300, 4.0, 0.0, 0.10, dd);
+    }
+
+    // DD3: Wind OU dominant, no repeatable structure. GPG cannot learn
+    // anything; pure disturbance-rejection test.
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 0.3;
+        dd.ripple_T  = 0.0;
+        dd.wind_tau   = 20.0;
+        dd.wind_sigma = 0.15;   // arcsec/s rate disturbance
+        runDirectDriveScenario(
+            "DD3: DD + wind OU  tau=20s  sigma=0.15\"/s  noise=0.10\"\n"
+            "    [no repeatable structure; pure disturbance-rejection test, GPG cannot learn]",
+            300, 4.0, 0.0, 0.10, dd);
+    }
+
+    // DD4: Sluggish inner servo (tau_servo = 1.5s vs default 0.3s). Models
+    // a cheap or under-tuned DD servo. Corrections lag the command;
+    // aggressive guiders can excite oscillation.
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 1.5;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.05;
+        runDirectDriveScenario(
+            "DD4: Sluggish DD servo  tau_servo=1.5s  ripple_T=30s  A1=0.05\"/s  noise=0.10\"\n"
+            "    [slow inner loop: correction takes several seconds to settle;\n"
+            "     aggressive gains may oscillate]",
+            300, 4.0, 0.0, 0.10, dd);
+    }
+
+    // DD5: Structural mode aliased into the band. Small under-damped mount
+    // resonance; sanity check that algorithms tolerate aliased noise.
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 0.3;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.02;
+        dd.mode_hz   = 6.0;    // well above guide Nyquist -> aliased
+        dd.mode_zeta = 0.05;
+        dd.mode_A    = 0.05;
+        runDirectDriveScenario(
+            "DD5: DD + structural mode  mode=6Hz zeta=0.05 A=0.05\"  noise=0.10\"\n"
+            "    [under-damped mount resonance aliased into the guide band; nothing should blow up]",
+            300, 4.0, 0.0, 0.10, dd);
     }
 
     printf("\n");
