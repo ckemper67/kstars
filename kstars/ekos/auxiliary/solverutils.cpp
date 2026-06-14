@@ -6,6 +6,7 @@
 
 #include "solverutils.h"
 
+#include "ekos_debug.h"
 #include "fitsviewer/fitsdata.h"
 #include "Options.h"
 #include <QRegularExpression>
@@ -247,7 +248,25 @@ void SolverUtils::patchMultiAlgorithm(StellarSolver *solver)
     if (params.multiAlgorithm == MULTI_AUTO)
     {
         bool usePosition = solver->property("UsePosition").toBool();
-        params.multiAlgorithm = usePosition ? MULTI_DEPTHS : MULTI_SCALES;
+        // MULTI_DEPTHS partitions the star-depth axis across threads, which
+        // helps when a position hint constrains the healpix search area but
+        // only if the scale window is also narrow enough for each thread to
+        // work a meaningful slice. With maxwidth at the full-sky default (180)
+        // there is no useful scale partitioning, so fall back to MULTI_SCALES.
+        bool scaleConstrained = params.maxwidth < 180.0;
+        if (usePosition && !scaleConstrained)
+        {
+            static bool s_warnedMaxwidth = false;
+            if (!s_warnedMaxwidth)
+            {
+                s_warnedMaxwidth = true;
+                qCInfo(KSTARS_EKOS) << "Position hint available, but solver profile maxwidth is"
+                                    << params.maxwidth
+                                    << "deg (full sky) -- parallel solving cannot take advantage of the hint."
+                                    << "For faster solves, set a narrower maxwidth (e.g. 10 deg) in your solver profile.";
+            }
+        }
+        params.multiAlgorithm = (usePosition && scaleConstrained) ? MULTI_DEPTHS : MULTI_SCALES;
         solver->setParameters(params);
     }
 }
