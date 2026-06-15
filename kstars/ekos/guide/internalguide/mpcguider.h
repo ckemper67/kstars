@@ -117,6 +117,10 @@ class MPCGuider
         // Controller / Plant parameters
         double m_Q { 10.0 };
         double m_R { 0.1 };
+        // Default plant: pure-integrator. setMountType overrides this
+        // based on the chosen class (Auto picks a safer tau=0.5s default;
+        // explicit non-Auto types preserve pure-integrator). Call order
+        // matters: setMountType after setParameters wins for m_J.
         double m_J { 1e-6 };
         double m_Bf { 1.0 };
         double m_Kt { 1.0 };

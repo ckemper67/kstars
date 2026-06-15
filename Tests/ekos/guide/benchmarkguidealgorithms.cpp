@@ -2232,9 +2232,11 @@ int main(int argc, char *argv[])
         }
         {
             // Explicit Auto for clarity (it is the default). No setServoLag
-            // -- servo-lag detection should figure out tau_servo from
-            // observed step response.
-            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::Auto); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            // -- detection or the Auto-mode safer-default plant handles
+            // this. setMountType must come AFTER setParameters because
+            // setParameters' J default is the pure-integrator limit, and
+            // setMountType installs the per-class plant default.
+            MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMountType(MPCGuider::MountType::Auto); g.setMinMove(0.1);
             auto r = runCLDirectDrive("MPCGuider (Auto)", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
             printRow(r);
         }

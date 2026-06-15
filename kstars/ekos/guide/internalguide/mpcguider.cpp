@@ -88,6 +88,13 @@ void MPCGuider::setMountType(MountType type)
             // Both detectors active; effective type updates on convergence.
             m_ServoLagDetectorActive = !m_ServoLagManuallySet;
             m_HarmonicDetectorActive = !m_IsHarmonicDetected;
+            // Auto-mode default plant: tau = J/Bf = 0.5s. Conservative
+            // enough that sluggish-DD-mount-style blowup does not happen
+            // (tau=1.5 mount + tau=0 model -> oscillates; tau=1.5 mount +
+            // tau=0.5 model -> bounded), while fast mounts pay a small
+            // commands-are-mildly-conservative cost. The servo-lag
+            // detector refines from here.
+            if (!m_ServoLagManuallySet) { m_J = 0.5; m_Initialized = false; }
             break;
         case MountType::WormGear:
         case MountType::Belt:
@@ -95,19 +102,23 @@ void MPCGuider::setMountType(MountType type)
             // Worm-gear, belt, and strain-wave plants share the rigid /
             // flexible plant shape -- no inner velocity servo to identify.
             // Disable servo-lag detector. Harmonic-drive detection (R bump
-            // on fast PE) stays enabled because it is independent of plant
-            // identification and is the right call for any of these
-            // classes when their disturbance spectrum justifies it.
+            // on fast PE) stays enabled. Motor block runs as pure
+            // integrator (J=1e-6) -- these classes are designed and tuned
+            // for that limit.
             m_ServoLagDetectorActive = false;
             m_HarmonicDetectorActive = true;
+            if (!m_ServoLagManuallySet) { m_J = 1e-6; m_Initialized = false; }
             break;
         case MountType::DirectDrive:
             // Servo-lag detection on (unless user already pinned tau via
             // setServoLag). Harmonic R bump is wrong for DD: a DD's fast
             // response can look like high velocity/offset ratio without
-            // any real fast-PE disturbance to suppress.
+            // any real fast-PE disturbance to suppress. Plant defaults
+            // to the Auto-style safer tau=0.5 until detection or manual
+            // setServoLag refines it.
             m_ServoLagDetectorActive = !m_ServoLagManuallySet;
             m_HarmonicDetectorActive = false;
+            if (!m_ServoLagManuallySet) { m_J = 0.5; m_Initialized = false; }
             break;
     }
 }
