@@ -172,10 +172,25 @@ class MPCGuider
         bool m_ServoLagDetectorActive { true };
         bool m_HarmonicDetectorActive { true };
 
-        // Servo-lag auto-detection state
+        // Servo-lag auto-detection state. Two parallel identification
+        // methods (cross-check): Method A is the one-step response ratio
+        // r1 = (err_prev - err)/u_prev. Method B is a 3-step ratio with
+        // an isolation constraint (no intermediate corrections), giving
+        // a sample with different sensitivity to dt and disturbance. We
+        // commit a new plant tau only when both methods independently
+        // converge AND agree within 30%. This guards against silent
+        // biased commits (one-step ratio failure mode: when dt is wrong
+        // or disturbance is correlated, Method A can produce a
+        // confident-but-wrong tau; Method B disagrees and the cross-
+        // check refuses to commit).
         bool m_ServoLagManuallySet { false };
-        double m_AutoServoLag { 0.0 };           // detected tau (0 = not yet)
-        std::vector<double> m_ServoLagSamples;   // ring buffer of tau_est
+        double m_AutoServoLag { 0.0 };           // committed tau (0 = no commit yet)
+        double m_AutoServoLagA { 0.0 };          // Method A's current median
+        double m_AutoServoLagB { 0.0 };          // Method B's current median
+        std::vector<double> m_ServoLagSamples;   // Method A's sample buffer
+        std::vector<double> m_ServoLagSamplesB;  // Method B's sample buffer
+        std::vector<double> m_OffsetWindow;      // last 4 offsets (for Method B)
+        std::vector<double> m_UWindow;           // last 4 u values (for Method B)
         double m_PrevU { 0.0 };
         bool m_HasPrevU { false };
 

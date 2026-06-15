@@ -40,7 +40,12 @@ void MPCGuider::reset()
     // Servo-lag detection state -- forget the session estimate. Mount type
     // (m_MountType) and manual override (m_ServoLagManuallySet) persist.
     m_AutoServoLag = 0.0;
+    m_AutoServoLagA = 0.0;
+    m_AutoServoLagB = 0.0;
     m_ServoLagSamples.clear();
+    m_ServoLagSamplesB.clear();
+    m_OffsetWindow.clear();
+    m_UWindow.clear();
     m_PrevU = 0.0;
     m_HasPrevU = false;
     m_EffectiveMountType = m_MountType;
@@ -148,17 +153,19 @@ double MPCGuider::guide(double offset)
     double velocity = delta_theta / dt;
     double delta_omega = m_HasPrevVelocity ? (velocity - m_PrevVelocity) : 0.0;
 
-    // Servo-lag detector sample (one-step ratio). Must run BEFORE
-    // m_PrevOffset is overwritten so we have the previous frame's error.
+    // Servo-lag detector: two parallel methods with cross-check.
     // Skipped when: detector disabled (non-Auto/DD mount type), tau set
     // manually, compliance declared (different plant topology), or no
     // prior u_correction recorded yet.
+    // Must run BEFORE m_PrevOffset is overwritten.
     if (m_ServoLagDetectorActive && !m_ServoLagManuallySet && m_Ks == 0.0
         && m_HasPrevU && m_HasPrevOffset && dt > 0.0)
     {
         const double prev_err = m_PrevOffset;  // err(k)
         const double curr_err = offset;        // err(k+1)
         const double u_prev = m_PrevU;
+
+        // --- Method A: one-step response ratio ---
         if (std::abs(u_prev) > 0.5)
         {
             const double r = (prev_err - curr_err) / u_prev;
@@ -170,38 +177,106 @@ double MPCGuider::guide(double offset)
                     m_ServoLagSamples.push_back(tau_est);
                     if (m_ServoLagSamples.size() > 16)
                         m_ServoLagSamples.erase(m_ServoLagSamples.begin());
-
                     if (m_ServoLagSamples.size() >= 8)
                     {
                         std::vector<double> sorted = m_ServoLagSamples;
                         std::sort(sorted.begin(), sorted.end());
-                        const double tau_hat = sorted[sorted.size() / 2];
+                        m_AutoServoLagA = sorted[sorted.size() / 2];
+                    }
+                }
+            }
+        }
 
-                        const bool firstCommit = (m_AutoServoLag <= 0.0);
-                        const bool drift = (!firstCommit
-                            && std::abs(tau_hat - m_AutoServoLag) / m_AutoServoLag > 0.20);
-                        if (firstCommit || drift)
+        // --- Method B: 3-step ratio with isolation constraint ---
+        // Use the rolling 4-entry windows of (offset, u). The window holds
+        // (offset[k-3], offset[k-2], offset[k-1], offset[k=curr_err]) and
+        // similarly for u, where u[k-1]=u_prev was the correction commanded
+        // at the previous guide() call. We need |u[k-3]| large (the
+        // originating correction we want to measure response to) AND
+        // |u[k-2]|, |u[k-1]| small (isolation: no intermediate corrections
+        // contaminating the decay between k-3 and k).
+        if (m_OffsetWindow.size() >= 3 && m_UWindow.size() >= 3)
+        {
+            const double off_k3 = m_OffsetWindow[m_OffsetWindow.size() - 3];
+            const double u_k3   = m_UWindow[m_UWindow.size() - 3];
+            const double u_k2   = m_UWindow[m_UWindow.size() - 2];
+            const double u_k1   = m_UWindow[m_UWindow.size() - 1];
+            if (std::abs(u_k3) > 0.5
+                && std::abs(u_k2) < 0.15
+                && std::abs(u_k1) < 0.15)
+            {
+                const double r3 = (off_k3 - curr_err) / u_k3;
+                if (r3 > 0.05 && r3 < 0.99)
+                {
+                    const double tau_est = -3.0 * dt / std::log(1.0 - r3);
+                    if (tau_est > 0.05 && tau_est < 10.0)
+                    {
+                        m_ServoLagSamplesB.push_back(tau_est);
+                        if (m_ServoLagSamplesB.size() > 16)
+                            m_ServoLagSamplesB.erase(m_ServoLagSamplesB.begin());
+                        if (m_ServoLagSamplesB.size() >= 8)
                         {
-                            m_AutoServoLag = tau_hat;
-                            m_J = tau_hat;
-                            m_Bf = 1.0;
-                            m_Kt = 1.0;
-                            m_Initialized = false;
-                            qCDebug(KSTARS_EKOS_GUIDE) << QString(
-                                "[MPCGuider %1] Servo lag detected: tau=%2s (median of %3 samples)")
-                                .arg(m_ID).arg(tau_hat, 0, 'f', 3).arg(m_ServoLagSamples.size());
-                            if (m_MountType == MountType::Auto
-                                && m_EffectiveMountType != MountType::DirectDrive)
-                            {
-                                m_EffectiveMountType = MountType::DirectDrive;
-                                m_HarmonicDetectorActive = false;
-                                qCDebug(KSTARS_EKOS_GUIDE) << QString(
-                                    "[MPCGuider %1] Effective mount type -> DirectDrive (via servo-lag detection)")
-                                    .arg(m_ID);
-                            }
+                            std::vector<double> sorted = m_ServoLagSamplesB;
+                            std::sort(sorted.begin(), sorted.end());
+                            m_AutoServoLagB = sorted[sorted.size() / 2];
                         }
                     }
                 }
+            }
+        }
+
+        // Push current observations to the rolling windows (after Method B
+        // looked at the "before-current" state). Window size 4: enough for
+        // 3-step lookback.
+        m_OffsetWindow.push_back(curr_err);
+        m_UWindow.push_back(u_prev);
+        if (m_OffsetWindow.size() > 4)
+            m_OffsetWindow.erase(m_OffsetWindow.begin());
+        if (m_UWindow.size() > 4)
+            m_UWindow.erase(m_UWindow.begin());
+
+        // --- Cross-check + commit ---
+        // Both methods must have committed candidates AND agree within 30%.
+        // Otherwise the plant stays at its current (safer-default or last-
+        // committed) value -- no silent biased commits.
+        if (m_AutoServoLagA > 0.0 && m_AutoServoLagB > 0.0)
+        {
+            const double mean_tau = 0.5 * (m_AutoServoLagA + m_AutoServoLagB);
+            const double disagree = std::abs(m_AutoServoLagA - m_AutoServoLagB)
+                                    / std::max(mean_tau, 1e-9);
+            if (disagree < 0.30)
+            {
+                const bool firstCommit = (m_AutoServoLag <= 0.0);
+                const bool drift = (!firstCommit
+                    && std::abs(mean_tau - m_AutoServoLag) / m_AutoServoLag > 0.20);
+                if (firstCommit || drift)
+                {
+                    m_AutoServoLag = mean_tau;
+                    m_J = mean_tau;
+                    m_Bf = 1.0;
+                    m_Kt = 1.0;
+                    m_Initialized = false;
+                    qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                        "[MPCGuider %1] Servo lag detected: tau=%2s (Method A: %3s, Method B: %4s, agree)")
+                        .arg(m_ID).arg(mean_tau, 0, 'f', 3)
+                        .arg(m_AutoServoLagA, 0, 'f', 3).arg(m_AutoServoLagB, 0, 'f', 3);
+                    if (m_MountType == MountType::Auto
+                        && m_EffectiveMountType != MountType::DirectDrive)
+                    {
+                        m_EffectiveMountType = MountType::DirectDrive;
+                        m_HarmonicDetectorActive = false;
+                        qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                            "[MPCGuider %1] Effective mount type -> DirectDrive (via servo-lag detection)")
+                            .arg(m_ID);
+                    }
+                }
+            }
+            else
+            {
+                qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                    "[MPCGuider %1] Servo lag cross-check: methods disagree (A=%2s, B=%3s, %4%% diff). Plant unchanged.")
+                    .arg(m_ID).arg(m_AutoServoLagA, 0, 'f', 3)
+                    .arg(m_AutoServoLagB, 0, 'f', 3).arg(100.0 * disagree, 0, 'f', 0);
             }
         }
     }
