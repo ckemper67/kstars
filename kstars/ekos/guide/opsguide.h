@@ -43,7 +43,8 @@ class OpsGuide : public QFrame, public Ui::OpsGuide
             STANDARD_ALGORITHM = 0,
             HYSTERESIS_ALGORITHM,
             LINEAR_ALGORITHM,
-            GPG_ALGORITHM
+            GPG_ALGORITHM,
+            MPC_ALGORITHM
         };
 
     Q_SIGNALS:
@@ -52,6 +53,8 @@ class OpsGuide : public QFrame, public Ui::OpsGuide
     private Q_SLOTS:
         void setRAGuidePulseAlg(int index);
         void setDECGuidePulseAlg(int index);
+        void slotRAMPCHarmonicToggled(bool checked);
+        void slotDECMPCHarmonicToggled(bool checked);
 
     private:
         KConfigDialog *m_ConfigDialog { nullptr };

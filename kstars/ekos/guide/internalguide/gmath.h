@@ -31,6 +31,7 @@ class Edge;
 class GuideLog;
 class LinearGuider;
 class HysteresisGuider;
+class MPCGuider;
 
 // For now also copied in guidealgorithms.cpp
 #define SMART_THRESHOLD    0
@@ -222,6 +223,8 @@ class cgmath : public QObject
         std::unique_ptr < LinearGuider > m_DECLinearGuider;
         std::unique_ptr < HysteresisGuider > m_RAHysteresisGuider;
         std::unique_ptr < HysteresisGuider > m_DECHysteresisGuider;
+        std::unique_ptr < MPCGuider > m_RAMPCGuider;
+        std::unique_ptr < MPCGuider > m_DECMPCGuider;
 
         Calibration calibration;
         bool configureInParams(Ekos::GuideState state);
