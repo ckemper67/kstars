@@ -128,6 +128,25 @@ static double absHarmonicPE(const PEParams &pe, double t)
     return v;
 }
 
+// Analytic d/dt of the harmonic component of absHarmonicPE. Uses the
+// instantaneous angular frequency 2*pi/T(t) -- with T(t) = T0 + Tdot*t --
+// so the rate stays consistent with the drifting phase used by
+// absHarmonicPE(). Returns 0 for non-harmonic waveforms (sawtooth/triangle/
+// half-rectified) because their slopes are piecewise/non-smooth; the
+// 2-mass spring's velocity-damping term is dominated by motor/axis
+// inertia in those scenarios, so a zero PE-rate is the safe approximation.
+static inline double harmonicPERate(const PEParams &pe, double t)
+{
+    if (pe.T <= 0.0 || pe.waveform != PE_HARMONIC) return 0.0;
+    const double Tt = pe.T + pe.Tdot * t;           // instantaneous period
+    if (Tt <= 0.0) return 0.0;
+    const double omega = 2.0 * M_PI / Tt;            // instantaneous freq
+    const double arg = driftingPhase(pe.T, pe.Tdot, t);
+    return pe.A1 * omega       * std::cos(arg)
+         + pe.A2 * 2.0 * omega * std::cos(2.0 * arg + pe.phi2)
+         + pe.A3 * 3.0 * omega * std::cos(3.0 * arg + pe.phi3);
+}
+
 // Advance OU state by one frame and return the new value.
 static double advanceOU(const PEParams &pe, double &ouX, double dt, uint32_t &s)
 {
@@ -136,6 +155,87 @@ static double advanceOU(const PEParams &pe, double &ouX, double dt, uint32_t &s)
     double sigStep  = pe.ouSigSS * std::sqrt(1.0 - alpha * alpha);
     ouX = alpha * ouX + sigStep * gaussNoise(s, 1.0);
     return ouX;
+}
+
+// ---------------------------------------------------------------------------
+// Measurement model: colored seeing + centroid outliers
+// ---------------------------------------------------------------------------
+//
+// The classic noiseSigma parameter models a per-frame white Gaussian
+// observation noise -- a workable stand-in for read+photon noise but a
+// poor proxy for atmospheric seeing. Real seeing has correlation time
+// in the 0.1-1 s range; over a multi-second guide exposure the slow
+// component survives averaging and shows up as a position-domain
+// disturbance whose RMS depends on the guider's smoothing length.
+// Modelling it as white noise unfairly rewards algorithms with long
+// smoothing windows (LinearGuider with high length, etc.).
+//
+// Centroid outliers handle the other measurement pathology: an
+// occasional bad frame (cosmic-ray hit, saturated star, satellite
+// trail) that produces a position spike several sigma above the noise
+// floor. Different guide algorithms tolerate these differently.
+//
+// Both are opt-in (defaults leave the existing white-noise-only
+// measurement model unchanged).
+struct MeasParams
+{
+    // Colored seeing: Ornstein-Uhlenbeck process at the measurement layer.
+    // seeingTau = 0 disables it.
+    double seeingTau   = 0.0;   // correlation time (s)
+    double seeingSigma = 0.0;   // steady-state sigma (arcsec)
+
+    // Centroid outliers: per-frame Bernoulli + amplified Gaussian.
+    // outlierProb = 0 disables it.
+    double outlierProb = 0.0;        // probability per frame, [0,1]
+    double outlierMult = 4.0;        // outlier amplitude as multiple of noiseSigma
+};
+
+// Per-runner measurement-noise state and helpers.
+struct MeasState
+{
+    double seeing = 0.0;        // OU value, advanced once per frame
+    uint32_t whiteSeed   = 0;   // white-noise stream
+    uint32_t seeingSeed  = 0;   // seeing OU stream
+    uint32_t outlierSeed = 0;   // outlier Bernoulli + amplified-Gaussian stream
+};
+
+static inline MeasState makeMeasState(uint32_t baseSeed)
+{
+    return MeasState{ 0.0, baseSeed,
+                      baseSeed ^ 0x5EEDu,
+                      baseSeed ^ 0xBADCEE7Du };
+}
+
+// Advance seeing OU by one full frame and return the new value. Reuses the
+// same closed-form transition as advanceOU(); kept inline so each runner
+// pays only one transcendental per frame.
+static inline double advanceSeeing(MeasState &ms, const MeasParams &mp, double dt)
+{
+    if (mp.seeingTau <= 0.0 || mp.seeingSigma <= 0.0) { ms.seeing = 0.0; return 0.0; }
+    const double a = std::exp(-dt / mp.seeingTau);
+    const double sd = mp.seeingSigma * std::sqrt(1.0 - a * a);
+    ms.seeing = a * ms.seeing + sd * gaussNoise(ms.seeingSeed, 1.0);
+    return ms.seeing;
+}
+
+// Generate one frame of measurement noise: white + colored seeing + optional
+// outlier. Outlier amplitude is in units of noiseSigma * outlierMult.
+static inline double measurementNoise(MeasState &ms, const MeasParams &mp,
+                                      double noiseSigma, double dt)
+{
+    double n = gaussNoise(ms.whiteSeed, noiseSigma);
+    n += advanceSeeing(ms, mp, dt);
+    if (mp.outlierProb > 0.0)
+    {
+        // 32-bit uniform in [0,1) from the outlier-seed stream.
+        uint32_t r = ms.outlierSeed;
+        r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+        ms.outlierSeed = r;
+        const double u = (r & 0xFFFFu) / 65536.0;
+        if (u < mp.outlierProb)
+            n += gaussNoise(ms.outlierSeed, noiseSigma * mp.outlierMult);
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +266,12 @@ static double detrendedRMS(const std::vector<double> &v)
     return std::sqrt(sq / n);
 }
 
+// Forward declaration: the OU rate-disturbance step used by the DD plant
+// and by the 2-mass / SW plants for the optional wind disturbance. Defined
+// near the DD plant block below.
+static inline double ddWindStep(double &x, double tau, double sigma_ss,
+                                double dt, uint32_t &s);
+
 // ---------------------------------------------------------------------------
 // Closed-loop runners
 // ---------------------------------------------------------------------------
@@ -177,9 +283,11 @@ static Stats runCL(const std::string &name, Guider &g,
                    int frames, double exposure,
                    double driftPerFrame, const PEParams &pe,
                    double noiseSigma, uint32_t seed,
-                   const Steps &steps = {}, bool collectAll = false)
+                   const Steps &steps = {}, bool collectAll = false,
+                   const MeasParams &mp = {})
 {
-    uint32_t sn = seed, so = seed + 1000000u;
+    MeasState ms = makeMeasState(seed);
+    uint32_t so = seed + 1000000u;
     double pos = 0.0, ouX = 0.0;
     double prevPE = absHarmonicPE(pe, 0.0);
     double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
@@ -201,7 +309,7 @@ static Stats runCL(const std::string &name, Guider &g,
         double openPos = i * driftPerFrame + currPE;
         sqOpen += openPos * openPos;
 
-        double meas = pos + gaussNoise(sn, noiseSigma);
+        double meas = pos + measurementNoise(ms, mp, noiseSigma, exposure);
         pos -= g.guide(meas);
 
         // Evaluate at the next measurement time (what the next exposure will see),
@@ -228,9 +336,11 @@ static Stats runCLGPG(const std::string &name, GaussianProcessGuider &gpg,
                       int frames, double exposure,
                       double driftPerFrame, const PEParams &pe,
                       double noiseSigma, uint32_t seed,
-                      const Steps &steps = {}, bool collectAll = false)
+                      const Steps &steps = {}, bool collectAll = false,
+                      const MeasParams &mp = {})
 {
-    uint32_t sn = seed, so = seed + 1000000u;
+    MeasState ms = makeMeasState(seed);
+    uint32_t so = seed + 1000000u;
     double pos = 0.0, ouX = 0.0;
     double prevPE = absHarmonicPE(pe, 0.0);
     double sqOpen = 0.0, sqAll = 0.0, sqFinal = 0.0;
@@ -252,7 +362,7 @@ static Stats runCLGPG(const std::string &name, GaussianProcessGuider &gpg,
         double openPos = i * driftPerFrame + currPE;
         sqOpen += openPos * openPos;
 
-        double meas = pos + gaussNoise(sn, noiseSigma);
+        double meas = pos + measurementNoise(ms, mp, noiseSigma, exposure);
         pos -= gpg.result(meas, 100.0, exposure);
 
         // Evaluate at next measurement time (see runCL note above).
@@ -398,6 +508,10 @@ struct Sim2MassParams {
     double backlash = 0.0; // arcsec; gear play (deadband in motor-axis coupling).
                            // 0 = rigid teeth contact; >0 = no spring force while
                            // |theta_m - theta_a + pe| < backlash.
+
+    // Wind / balance OU rate disturbance applied to the axis. 0 = off.
+    double wind_tau   = 20.0;  // s, correlation time
+    double wind_sigma = 0.0;   // arcsec/s, steady-state sigma
 };
 
 // Compute the gear spring torque accounting for an optional backlash deadband.
@@ -421,9 +535,12 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
                         double driftPerFrame, const PEParams &peParams,
                         double noiseSigma, uint32_t seed,
                         const Sim2MassParams &sim,
-                        const Steps &steps = {}, bool collectAll = false)
+                        const Steps &steps = {}, bool collectAll = false,
+                        const MeasParams &mp = {})
 {
-    uint32_t sn = seed;
+    MeasState ms = makeMeasState(seed);
+    uint32_t wind_seed = seed + 4000000u;
+    double wind_2m = 0.0;
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -449,28 +566,25 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
         double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
         sqOpen += openPos * openPos;
 
-        double meas = theta_a + gaussNoise(sn, noiseSigma);
+        double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         double corr = g.guide(meas);
         theta_m -= corr;
 
         // Multi-rate physical integration loop for compliance/vibrations/friction
         for (int s = 0; s < stepsPerFrame; ++s) {
             double current_t = t_start + s * h;
-            
+
             double pe = absHarmonicPE(peParams, current_t);
-            double arg = 2.0 * M_PI * current_t / peParams.T;
-            double pe_rate = (peParams.T > 0.0) ? (peParams.A1 * (2.0 * M_PI / peParams.T) * std::cos(arg)
-                             + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
-                             + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
-            
+            double pe_rate = harmonicPERate(peParams, current_t);
+
             double T_spring = computeSpringTorque(theta_m - theta_a + pe,
                                                   omega_m - omega_a + pe_rate,
                                                   sim.Ks, sim.Bs, sim.backlash);
-            
+
             double omega_m_dot = (-sim.Bf * omega_m - T_spring) / sim.Jm;
             theta_m += h * omega_m;
             omega_m += h * omega_m_dot;
-            
+
             double T_friction = 0.0;
             if (std::abs(omega_a) < 1e-4) {
                 if (std::abs(T_spring) < sim.stiction) {
@@ -482,10 +596,17 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
             } else {
                 T_friction = sim.coulomb * (omega_a > 0.0 ? 1.0 : -1.0);
             }
-            
+
             double omega_a_dot = (T_spring - sim.Ba * omega_a - T_friction) / sim.Ja;
             theta_a += h * omega_a;
             omega_a += h * omega_a_dot;
+
+            // Wind: OU rate disturbance directly on the axis position.
+            if (sim.wind_sigma > 0.0)
+            {
+                ddWindStep(wind_2m, sim.wind_tau, sim.wind_sigma, h, wind_seed);
+                theta_a += wind_2m * h;
+            }
         }
 
         sqAll += theta_a * theta_a;
@@ -508,9 +629,12 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
                            double driftPerFrame, const PEParams &peParams,
                            double noiseSigma, uint32_t seed,
                            const Sim2MassParams &sim,
-                           const Steps &steps = {}, bool collectAll = false)
+                           const Steps &steps = {}, bool collectAll = false,
+                           const MeasParams &mp = {})
 {
-    uint32_t sn = seed;
+    MeasState ms = makeMeasState(seed);
+    uint32_t wind_seed = seed + 4000000u;
+    double wind_2m = 0.0;
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -536,7 +660,7 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
         double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
         sqOpen += openPos * openPos;
 
-        double meas = theta_a + gaussNoise(sn, noiseSigma);
+        double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         double corr = gpg.result(meas, 100.0, exposure);
         theta_m -= corr;
 
@@ -545,10 +669,7 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
             double current_t = t_start + s * h;
             
             double pe = absHarmonicPE(peParams, current_t);
-            double arg = 2.0 * M_PI * current_t / peParams.T;
-            double pe_rate = (peParams.T > 0.0) ? (peParams.A1 * (2.0 * M_PI / peParams.T) * std::cos(arg)
-                             + peParams.A2 * (4.0 * M_PI / peParams.T) * std::cos(2.0 * arg + peParams.phi2)
-                             + peParams.A3 * (6.0 * M_PI / peParams.T) * std::cos(3.0 * arg + peParams.phi3)) : 0.0;
+            double pe_rate = harmonicPERate(peParams, current_t);
             
             double T_spring = computeSpringTorque(theta_m - theta_a + pe,
                                                   omega_m - omega_a + pe_rate,
@@ -573,6 +694,13 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
             double omega_a_dot = (T_spring - sim.Ba * omega_a - T_friction) / sim.Ja;
             theta_a += h * omega_a;
             omega_a += h * omega_a_dot;
+
+            // Wind: OU rate disturbance directly on the axis position.
+            if (sim.wind_sigma > 0.0)
+            {
+                ddWindStep(wind_2m, sim.wind_tau, sim.wind_sigma, h, wind_seed);
+                theta_a += wind_2m * h;
+            }
         }
 
         sqAll += theta_a * theta_a;
@@ -633,6 +761,17 @@ struct SimDirectDriveParams {
 
     // Inner servo noise floor (arcsec/s rms, added once per micro-step).
     double servo_noise = 0.0;
+
+    // Pulse-train rate model. If > 0, the guider's position correction is
+    // executed as a fixed-rate command of magnitude pulse_rate (arcsec/s)
+    // for duration |corr|/pulse_rate, then the rate command returns to 0
+    // for the remainder of the exposure. This matches real direct-drive
+    // mounts (typical guide-pulse rate is ~0.5x sidereal, so even a 2"
+    // correction completes in ~0.27 s of a 4 s exposure -- nothing like
+    // the "smear -corr/exposure across the whole frame" behavior the
+    // legacy model assumes). If 0 (the default), the legacy "smear"
+    // interpretation is used.
+    double pulse_rate = 0.0;        // arcsec/s; 0 = legacy smear behavior
 };
 
 static inline double ddRipple(const SimDirectDriveParams &dd, double t)
@@ -668,9 +807,11 @@ static Stats runCLDirectDrive(const std::string &name, Guider &g,
                               double driftPerFrame,
                               double noiseSigma, uint32_t seed,
                               const SimDirectDriveParams &dd,
-                              const Steps &steps = {}, bool collectAll = false)
+                              const Steps &steps = {}, bool collectAll = false,
+                              const MeasParams &mp = {})
 {
-    uint32_t sn = seed, sw = seed + 2000000u, sv = seed + 3000000u;
+    MeasState ms = makeMeasState(seed);
+    uint32_t sw = seed + 2000000u, sv = seed + 3000000u;
     double theta_a = 0.0;
     double axis_rate = 0.0;
     double wind = 0.0;
@@ -695,15 +836,29 @@ static Stats runCLDirectDrive(const std::string &name, Guider &g,
 
         sqOpen += open_pos * open_pos;
 
-        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         const double corr = g.guide(meas);
 
-        // Interpret the guider's position pulse as a rate command over the
-        // upcoming frame: rate_cmd = -corr / exposure.
-        const double rate_cmd = -corr / exposure;
+        // Interpret the guider's position pulse. The legacy model
+        // (pulse_rate == 0) smears the entire correction across the whole
+        // exposure: rate_cmd = -corr/exposure. The pulse-train model
+        // (pulse_rate > 0) executes the correction at a fixed rate
+        // -sign(corr)*pulse_rate for duration |corr|/pulse_rate, then the
+        // command returns to 0 for the rest of the exposure. Real DD mounts
+        // match the latter (typical guide rate ~0.5x sidereal -> even a 2"
+        // correction completes in ~0.3 s of a 4 s frame).
+        const double cmd_legacy   = -corr / exposure;
+        const double cmd_pulse    = (corr >= 0.0) ? -dd.pulse_rate : dd.pulse_rate;
+        const double pulse_dur    = (dd.pulse_rate > 0.0)
+                                    ? std::min(std::abs(corr) / dd.pulse_rate, exposure)
+                                    : exposure;
 
         for (int s = 0; s < stepsPerFrame; ++s) {
             const double current_t = t_start + s * h;
+            const double active = (dd.pulse_rate > 0.0)
+                                  ? ((current_t - t_start) < pulse_dur ? cmd_pulse : 0.0)
+                                  : cmd_legacy;
+            const double rate_cmd = active;
 
             // Inner servo: first-order rate tracking.
             const double tau = std::max(dd.tau_servo, 1e-6);
@@ -746,9 +901,11 @@ static Stats runCLGPGDirectDrive(const std::string &name,
                                  double driftPerFrame,
                                  double noiseSigma, uint32_t seed,
                                  const SimDirectDriveParams &dd,
-                                 const Steps &steps = {}, bool collectAll = false)
+                                 const Steps &steps = {}, bool collectAll = false,
+                                 const MeasParams &mp = {})
 {
-    uint32_t sn = seed, sw = seed + 2000000u, sv = seed + 3000000u;
+    MeasState ms = makeMeasState(seed);
+    uint32_t sw = seed + 2000000u, sv = seed + 3000000u;
     double theta_a = 0.0;
     double axis_rate = 0.0;
     double wind = 0.0;
@@ -773,7 +930,7 @@ static Stats runCLGPGDirectDrive(const std::string &name,
 
         sqOpen += open_pos * open_pos;
 
-        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         const double corr = gpg.result(meas, 100.0, exposure);
 
         const double rate_cmd = -corr / exposure;
@@ -866,6 +1023,10 @@ struct SimStrainWaveParams {
     // Dahl hysteresis (one state):
     double h_max = 0.2;        // arcsec, saturation displacement
     double Kh    = 10.0;       // torque-domain gain on h
+
+    // Wind / balance OU rate disturbance applied to the axis. 0 = off.
+    double wind_tau   = 20.0;  // s, correlation time
+    double wind_sigma = 0.0;   // arcsec/s, steady-state sigma
 };
 
 // Motor-angle-indexed kinematic error. phi is the wave-generator angle in
@@ -911,9 +1072,12 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
                              double driftPerFrame,
                              double noiseSigma, uint32_t seed,
                              const SimStrainWaveParams &sw,
-                             const Steps &steps = {}, bool collectAll = false)
+                             const Steps &steps = {}, bool collectAll = false,
+                             const MeasParams &mp = {})
 {
-    uint32_t sn = seed;
+    MeasState ms = makeMeasState(seed);
+    uint32_t wind_seed = seed + 4000000u;
+    double wind_2m = 0.0;
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -957,7 +1121,7 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
         const double open_residual = open_pos - swKE(sw, open_motor);
         sqOpen += open_residual * open_residual;
 
-        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         const double corr = g.guide(meas);
         theta_m -= corr;
 
@@ -996,6 +1160,13 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
             swDahlUpdate(h_dahl, d_theta_a, sw.h_max);
 
             T_prev = T_spring;
+
+            // Wind: OU rate disturbance directly on the axis position.
+            if (sw.wind_sigma > 0.0)
+            {
+                ddWindStep(wind_2m, sw.wind_tau, sw.wind_sigma, h_dt, wind_seed);
+                theta_a += wind_2m * h_dt;
+            }
         }
 
         sqAll += theta_a * theta_a;
@@ -1019,9 +1190,12 @@ static Stats runCLGPGStrainWave(const std::string &name,
                                 double driftPerFrame,
                                 double noiseSigma, uint32_t seed,
                                 const SimStrainWaveParams &sw,
-                                const Steps &steps = {}, bool collectAll = false)
+                                const Steps &steps = {}, bool collectAll = false,
+                                const MeasParams &mp = {})
 {
-    uint32_t sn = seed;
+    MeasState ms = makeMeasState(seed);
+    uint32_t wind_seed = seed + 4000000u;
+    double wind_2m = 0.0;
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -1056,7 +1230,7 @@ static Stats runCLGPGStrainWave(const std::string &name,
         const double open_residual = open_pos - swKE(sw, open_motor);
         sqOpen += open_residual * open_residual;
 
-        const double meas = theta_a + gaussNoise(sn, noiseSigma);
+        const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
         const double corr = gpg.result(meas, 100.0, exposure);
         theta_m -= corr;
 
@@ -1091,6 +1265,13 @@ static Stats runCLGPGStrainWave(const std::string &name,
             swDahlUpdate(h_dahl, d_theta_a, sw.h_max);
 
             T_prev = T_spring;
+
+            // Wind: OU rate disturbance directly on the axis position.
+            if (sw.wind_sigma > 0.0)
+            {
+                ddWindStep(wind_2m, sw.wind_tau, sw.wind_sigma, h_dt, wind_seed);
+                theta_a += wind_2m * h_dt;
+            }
         }
 
         sqAll += theta_a * theta_a;
@@ -2191,6 +2372,91 @@ int main(int argc, char *argv[])
             GaussianProcessGuider gpg(makeGPGParams(480.0, true));
             gpg.SetLearningRate(1.0);
             auto r = runCLGPG2Mass("GPG (learn)", gpg, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printRow(r);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Realistic seeing scenarios -- colored noise + occasional centroid outliers
+    // -----------------------------------------------------------------------
+    //
+    // The other scenarios use white Gaussian measurement noise, which an
+    // algorithm with a long smoothing window (LinearGuider with large length,
+    // GPG with broad SE kernel) can average away cleanly. Real atmospheric
+    // seeing has a colored spectrum: a slow component on top of the white
+    // floor. The slow component does not average out, so the apparent
+    // "noise-rejection" advantage of long smoothing is partially fictional.
+    //
+    // These scenarios opt into a MeasParams that models colored seeing via an
+    // OU process (tau=8s, sigma=0.4") on top of the existing white floor, and
+    // adds a 4% chance of a 4x-sigma centroid outlier per frame (bright-star
+    // saturation, satellite trail). Compare the algorithms' Final RMS in
+    // these scenarios against their counterparts above to see how robust each
+    // is to realistic measurement pathology.
+    {
+        PEParams pe;
+        pe.T = 480.0; pe.A1 = 10.0;
+        const uint32_t SEED = 42;
+        MeasParams seeing;
+        seeing.seeingTau   = 8.0;   // slow-component correlation time (s)
+        seeing.seeingSigma = 0.4;   // slow-component sigma (arcsec)
+        seeing.outlierProb = 0.04;  // 4% chance per frame
+        seeing.outlierMult = 4.0;   // outlier amplitude = 4x white sigma
+        const char *title =
+            "S1: Realistic worm PE + seeing  T=480s  A=10.0\"  white=0.30\"  "
+            "seeing OU(tau=8s,sigma=0.4\")  outliers=4%\n"
+            "    [colored seeing exposes algorithms whose smoothing assumes white noise]";
+        {
+            LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+            auto r = runCL("LinearGuider", g, 360, 4.0, 0.0, pe, 0.30, SEED, {}, false, seeing);
+            printHeader(title);
+            printRow(r);
+        }
+        {
+            HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+            auto r = runCL("HysteresisGuider", g, 360, 4.0, 0.0, pe, 0.30, SEED, {}, false, seeing);
+            printRow(r);
+        }
+        {
+            GaussianProcessGuider gpg(makeGPGParams(480.0, true));
+            gpg.SetLearningRate(1.0);
+            auto r = runCLGPG("GPG (learn)", gpg, 360, 4.0, 0.0, pe, 0.30, SEED, {}, false, seeing);
+            printRow(r);
+        }
+    }
+
+    // S2: Same plant compliance as WG7 (resonant 2-mass) but with realistic
+    // seeing on top, to see how compliance + colored noise interact.
+    {
+        PEParams pe;
+        pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
+        Sim2MassParams sim;
+        sim.Ks = 250.0; sim.Bs = 2.0;
+        const uint32_t SEED = 42;
+        MeasParams seeing;
+        seeing.seeingTau   = 8.0;
+        seeing.seeingSigma = 0.4;
+        seeing.outlierProb = 0.04;
+        seeing.outlierMult = 4.0;
+        const char *title =
+            "S2: 2-mass resonant + seeing  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  "
+            "Ks=250  white=0.10\"  seeing OU(tau=8s,sigma=0.4\")  outliers=4%\n"
+            "    [compliance + colored seeing: long-window smoothers pay more than under white noise]";
+        {
+            LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+            auto r = runCL2Mass("LinearGuider", g, 400, 2.0, 0.0, pe, 0.10, SEED, sim, {}, false, seeing);
+            printHeader(title);
+            printRow(r);
+        }
+        {
+            HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+            auto r = runCL2Mass("HysteresisGuider", g, 400, 2.0, 0.0, pe, 0.10, SEED, sim, {}, false, seeing);
+            printRow(r);
+        }
+        {
+            GaussianProcessGuider gpg(makeGPGParams(30.0, true));
+            gpg.SetLearningRate(1.0);
+            auto r = runCLGPG2Mass("GPG (learn)", gpg, 400, 2.0, 0.0, pe, 0.10, SEED, sim, {}, false, seeing);
             printRow(r);
         }
     }
