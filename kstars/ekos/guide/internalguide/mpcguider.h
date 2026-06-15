@@ -42,6 +42,22 @@ class MPCGuider
         void setMechanicalParams(double Ks, double Bs, double J_axis)
         { m_Ks = Ks; m_Bs = Bs; m_J_axis = J_axis; m_Initialized = false; }
 
+        // Declare a closed-loop velocity servo with first-order tracking lag
+        // (direct-drive mounts: 10Micron, ASA, ZWO TC40, etc.). The rigid
+        // 3-state plant already parameterizes the motor as a first-order rate
+        // loop with mechanical time constant tau = J/Bf; setting J=tau, Bf=1,
+        // Kt=1 makes the plant match a DD servo with first-order lag tau.
+        // Supersedes setParameters' J/Bf/Kt for the rigid path; call order
+        // does not matter. Default (no call) preserves pure-integrator
+        // behavior. This is a user-declared configuration; auto-detection
+        // from step-response identification is a follow-up.
+        void setServoLag(double tau)
+        {
+            if (tau < 1e-6) tau = 1e-6;
+            m_J = tau; m_Bf = 1.0; m_Kt = 1.0;
+            m_Initialized = false;
+        }
+
         // Time is implicitly computed. Returns correction in arcseconds.
         double guide(double offset);
 

@@ -1640,13 +1640,16 @@ static void runDirectDriveScenario(const char *title,
         {
             // DD has no compliance and no backlash: do NOT declare compliance to
             // MPC and do NOT set backlash. Punch-through stays gated off
-            // (MPCSolver guards on backlash_ > 0.0). The default rigid pure-
-            // integrator plant is the right match for a closed-loop DD servo.
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            // (MPCSolver guards on backlash_ > 0.0). Declare the inner-servo
+            // tracking lag via setServoLag so MPC's rigid 3-state plant has
+            // the right time constant (otherwise default pure-integrator
+            // plant assumes instant response and oscillates on sluggish
+            // servos -- see DD4).
+            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setServoLag(dd.tau_servo); gd.setMinMove(0.1);
             Stats sDef = runCLDirectDrive("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setParameters(Q, R); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
                 Stats s = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -1674,8 +1677,9 @@ static void runDirectDriveScenario(const char *title,
     }
     {
         // No compliance declaration, no backlash setting -- see tune branch
-        // comment above for why.
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        // comment above for why. Declare servo lag so MPC has the right
+        // plant time constant.
+        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
         auto r = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
         printRow(r);
     }
