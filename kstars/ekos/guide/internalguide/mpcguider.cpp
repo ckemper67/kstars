@@ -37,6 +37,16 @@ void MPCGuider::reset()
     m_IsHarmonicDetected = false;
     m_HarmonicDetectionCounter = 0;
 
+    // Servo-lag detection state -- forget the session estimate. Mount type
+    // (m_MountType) and manual override (m_ServoLagManuallySet) persist.
+    m_AutoServoLag = 0.0;
+    m_ServoLagSamples.clear();
+    m_PrevU = 0.0;
+    m_HasPrevU = false;
+    m_EffectiveMountType = m_MountType;
+    // Recompute detector gating from mount type (re-arm StrainWave's preset).
+    setMountType(m_MountType);
+
     m_Omega1 = 0.0;
     m_Omega2 = 0.0;
     m_LearnedT1 = 0.0;
@@ -68,6 +78,40 @@ void MPCGuider::setParameters(double Q, double R, double J, double Bf, double Kt
     m_Initialized = false;
 }
 
+void MPCGuider::setMountType(MountType type)
+{
+    m_MountType = type;
+    m_EffectiveMountType = type;
+    switch (type)
+    {
+        case MountType::Auto:
+            // Both detectors active; effective type updates on convergence.
+            m_ServoLagDetectorActive = !m_ServoLagManuallySet;
+            m_HarmonicDetectorActive = !m_IsHarmonicDetected;
+            break;
+        case MountType::WormGear:
+        case MountType::Belt:
+        case MountType::StrainWave:
+            // Worm-gear, belt, and strain-wave plants share the rigid /
+            // flexible plant shape -- no inner velocity servo to identify.
+            // Disable servo-lag detector. Harmonic-drive detection (R bump
+            // on fast PE) stays enabled because it is independent of plant
+            // identification and is the right call for any of these
+            // classes when their disturbance spectrum justifies it.
+            m_ServoLagDetectorActive = false;
+            m_HarmonicDetectorActive = true;
+            break;
+        case MountType::DirectDrive:
+            // Servo-lag detection on (unless user already pinned tau via
+            // setServoLag). Harmonic R bump is wrong for DD: a DD's fast
+            // response can look like high velocity/offset ratio without
+            // any real fast-PE disturbance to suppress.
+            m_ServoLagDetectorActive = !m_ServoLagManuallySet;
+            m_HarmonicDetectorActive = false;
+            break;
+    }
+}
+
 double MPCGuider::guide(double offset)
 {
     const QDateTime now = QDateTime::currentDateTime();
@@ -93,6 +137,64 @@ double MPCGuider::guide(double offset)
     double velocity = delta_theta / dt;
     double delta_omega = m_HasPrevVelocity ? (velocity - m_PrevVelocity) : 0.0;
 
+    // Servo-lag detector sample (one-step ratio). Must run BEFORE
+    // m_PrevOffset is overwritten so we have the previous frame's error.
+    // Skipped when: detector disabled (non-Auto/DD mount type), tau set
+    // manually, compliance declared (different plant topology), or no
+    // prior u_correction recorded yet.
+    if (m_ServoLagDetectorActive && !m_ServoLagManuallySet && m_Ks == 0.0
+        && m_HasPrevU && m_HasPrevOffset && dt > 0.0)
+    {
+        const double prev_err = m_PrevOffset;  // err(k)
+        const double curr_err = offset;        // err(k+1)
+        const double u_prev = m_PrevU;
+        if (std::abs(u_prev) > 0.5)
+        {
+            const double r = (prev_err - curr_err) / u_prev;
+            if (r > 0.05 && r < 0.95)
+            {
+                const double tau_est = -dt / std::log(1.0 - r);
+                if (tau_est > 0.05 && tau_est < 10.0)
+                {
+                    m_ServoLagSamples.push_back(tau_est);
+                    if (m_ServoLagSamples.size() > 16)
+                        m_ServoLagSamples.erase(m_ServoLagSamples.begin());
+
+                    if (m_ServoLagSamples.size() >= 8)
+                    {
+                        std::vector<double> sorted = m_ServoLagSamples;
+                        std::sort(sorted.begin(), sorted.end());
+                        const double tau_hat = sorted[sorted.size() / 2];
+
+                        const bool firstCommit = (m_AutoServoLag <= 0.0);
+                        const bool drift = (!firstCommit
+                            && std::abs(tau_hat - m_AutoServoLag) / m_AutoServoLag > 0.20);
+                        if (firstCommit || drift)
+                        {
+                            m_AutoServoLag = tau_hat;
+                            m_J = tau_hat;
+                            m_Bf = 1.0;
+                            m_Kt = 1.0;
+                            m_Initialized = false;
+                            qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                                "[MPCGuider %1] Servo lag detected: tau=%2s (median of %3 samples)")
+                                .arg(m_ID).arg(tau_hat, 0, 'f', 3).arg(m_ServoLagSamples.size());
+                            if (m_MountType == MountType::Auto
+                                && m_EffectiveMountType != MountType::DirectDrive)
+                            {
+                                m_EffectiveMountType = MountType::DirectDrive;
+                                m_HarmonicDetectorActive = false;
+                                qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                                    "[MPCGuider %1] Effective mount type -> DirectDrive (via servo-lag detection)")
+                                    .arg(m_ID);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Save states for next iteration
     m_PrevOffset = offset;
     m_PrevVelocity = velocity;
@@ -108,8 +210,10 @@ double MPCGuider::guide(double offset)
         m_VelocityHistory.erase(m_VelocityHistory.begin());
     }
 
-    // Passive learning classification: ratio of rate of error (velocity) RMS to absolute error RMS
-    if (m_OffsetHistory.size() >= 40 && !m_IsHarmonicDetected)
+    // Passive learning classification: ratio of rate of error (velocity) RMS to absolute error RMS.
+    // Gated by m_HarmonicDetectorActive -- non-Auto/non-StrainWave mount types
+    // disable this path (the R bump is wrong for DD or worm gear).
+    if (m_HarmonicDetectorActive && m_OffsetHistory.size() >= 40 && !m_IsHarmonicDetected)
     {
         double sum_sq_offset = 0.0;
         double sum_sq_velocity = 0.0;
@@ -132,6 +236,18 @@ double MPCGuider::guide(double offset)
                 m_IsHarmonicDetected = true;
                 qCDebug(KSTARS_EKOS_GUIDE) << QString("[MPCGuider %1] Passive Auto-Detection: Harmonic Drive mount signature identified (ratio=%2, RMS=%3\"). Dynamically raising control penalty R from %4 to 1.0 to prevent resonance.")
                                            .arg(m_ID).arg(ratio, 0, 'f', 3).arg(rms_offset, 0, 'f', 2).arg(m_R);
+                // In Auto mode, this resolves the effective mount type and
+                // suppresses the servo-lag detector (mutually exclusive
+                // routing on first converging detector).
+                if (m_MountType == MountType::Auto
+                    && m_EffectiveMountType != MountType::StrainWave)
+                {
+                    m_EffectiveMountType = MountType::StrainWave;
+                    m_ServoLagDetectorActive = false;
+                    qCDebug(KSTARS_EKOS_GUIDE) << QString(
+                        "[MPCGuider %1] Effective mount type -> StrainWave (via harmonic-drive detection)")
+                        .arg(m_ID);
+                }
             }
         }
         else
@@ -341,6 +457,11 @@ double MPCGuider::guide(double offset)
                                .arg(m_ID, 3).arg(m_GuiderIteration, 3).arg(m_Q, 4, 'f', 1).arg(activeR, 4, 'f', 2)
                                .arg(dt, 4, 'f', 2).arg(delta_theta, 5, 'f', 2).arg(delta_omega, 5, 'f', 2)
                                .arg(offset, 5, 'f', 2).arg(guideVal, 5, 'f', 2).arg(comment);
+
+    // Record the correction applied to the mount this frame so the next
+    // frame's servo-lag sample can compute the response ratio.
+    m_PrevU = guideVal;
+    m_HasPrevU = true;
 
     return guideVal;
 }

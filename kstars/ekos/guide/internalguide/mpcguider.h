@@ -19,6 +19,21 @@ class LaguerreNetwork;
 class MPCGuider
 {
     public:
+        // Primary user-facing configuration: pick the mount class. Auto runs
+        // detection across the servo-lag and harmonic-drive paths in parallel;
+        // the first to converge sets the effective type. Explicit non-Auto
+        // values pre-arm the appropriate detector and suppress the others.
+        // Numeric setters (setServoLag, setMechanicalParams, setBacklash) are
+        // advanced overrides; most users should pick a mount type and let
+        // detection handle the rest.
+        enum class MountType {
+            Auto,         // default; detect class from observed behavior
+            WormGear,     // rigid plant; FFT IMP only
+            DirectDrive,  // enable servo-lag detection (or honor manual hook)
+            StrainWave,   // pre-arm harmonic-drive R bump
+            Belt,         // single-stage compliance; same gating as WormGear
+        };
+
         MPCGuider(const QString &id);
         ~MPCGuider();
 
@@ -40,7 +55,13 @@ class MPCGuider
         // so the 5-state flexible plant is used. Full flexible-IMP fusion
         // (9 states) is a follow-up.
         void setMechanicalParams(double Ks, double Bs, double J_axis)
-        { m_Ks = Ks; m_Bs = Bs; m_J_axis = J_axis; m_Initialized = false; }
+        {
+            m_Ks = Ks; m_Bs = Bs; m_J_axis = J_axis;
+            m_Initialized = false;
+            // 5-state flexible plant has different topology than the rigid
+            // 3-state where servo-lag detection is defined; turn it off.
+            m_ServoLagDetectorActive = false;
+        }
 
         // Declare a closed-loop velocity servo with first-order tracking lag
         // (direct-drive mounts: 10Micron, ASA, ZWO TC40, etc.). The rigid
@@ -48,15 +69,39 @@ class MPCGuider
         // loop with mechanical time constant tau = J/Bf; setting J=tau, Bf=1,
         // Kt=1 makes the plant match a DD servo with first-order lag tau.
         // Supersedes setParameters' J/Bf/Kt for the rigid path; call order
-        // does not matter. Default (no call) preserves pure-integrator
-        // behavior. This is a user-declared configuration; auto-detection
-        // from step-response identification is a follow-up.
+        // does not matter. Locks the effective mount type to DirectDrive and
+        // disables servo-lag auto-detection for the lifetime of this guider.
+        // Most users: prefer setMountType(DirectDrive) and let auto-detect
+        // handle tau; setServoLag is an advanced override (tests, power
+        // users who measured tau on a bench).
         void setServoLag(double tau)
         {
             if (tau < 1e-6) tau = 1e-6;
             m_J = tau; m_Bf = 1.0; m_Kt = 1.0;
             m_Initialized = false;
+            m_ServoLagManuallySet = true;
+            m_ServoLagDetectorActive = false;
+            m_EffectiveMountType = MountType::DirectDrive;
         }
+
+        // Primary configuration: pick mount class. Defaults to Auto. See the
+        // MountType enum for semantics. Calling this resets detector gating
+        // to the appropriate defaults for the chosen class, but does not
+        // clear previously-set numeric overrides (setServoLag, setMechanical-
+        // Params, setBacklash).
+        void setMountType(MountType type);
+
+        // The class the user asked for (defaults to Auto).
+        MountType getMountType() const { return m_MountType; }
+
+        // The class currently in effect: same as getMountType() unless Auto
+        // is set and a detector has converged, in which case this returns
+        // the detected class.
+        MountType getEffectiveMountType() const { return m_EffectiveMountType; }
+
+        // Auto-detected servo lag in seconds. Returns 0 if detection has
+        // not converged or is disabled.
+        double getDetectedServoLag() const { return m_AutoServoLag; }
 
         // Time is implicitly computed. Returns correction in arcseconds.
         double guide(double offset);
@@ -116,6 +161,19 @@ class MPCGuider
         std::vector<double> m_VelocityHistory;
         bool m_IsHarmonicDetected { false };
         int m_HarmonicDetectionCounter { 0 };
+
+        // Mount type framework
+        MountType m_MountType { MountType::Auto };
+        MountType m_EffectiveMountType { MountType::Auto };
+        bool m_ServoLagDetectorActive { true };
+        bool m_HarmonicDetectorActive { true };
+
+        // Servo-lag auto-detection state
+        bool m_ServoLagManuallySet { false };
+        double m_AutoServoLag { 0.0 };           // detected tau (0 = not yet)
+        std::vector<double> m_ServoLagSamples;   // ring buffer of tau_est
+        double m_PrevU { 0.0 };
+        bool m_HasPrevU { false };
 
         QDateTime m_LastGuideTime;
         int m_GuiderIteration { 0 };

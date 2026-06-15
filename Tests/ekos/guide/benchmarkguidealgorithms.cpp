@@ -1166,6 +1166,10 @@ static void runComplianceScenario(const char *title,
         // MPCGuider
         {
             auto configureMPC = [&](MPCGuider &mpc, double Q, double R) {
+                // runComplianceScenario serves worm-gear (WG7-WG17) and belt
+                // (B1-B2). Both gate the same way: harmonic detector on,
+                // servo-lag detector off. WormGear is the canonical pick.
+                mpc.setMountType(MPCGuider::MountType::WormGear);
                 if (declareCompliance)
                     mpc.setParameters(Q, R, sim.Jm, sim.Bf, sim.Kt);
                 else
@@ -1207,6 +1211,7 @@ static void runComplianceScenario(const char *title,
     }
     {
         MPCGuider g("RA");
+        g.setMountType(MPCGuider::MountType::WormGear);
         // When the caller has opted in to compliance declaration, pass the
         // simulator's actual motor inertia and damping so the controller's
         // plant model matches the rig. The default J=1e-6 assumes an
@@ -1308,11 +1313,11 @@ static void runScenario(const char *title,
         }
         // MPCGuider sweep
         {
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
             Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
                 Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -1339,7 +1344,7 @@ static void runScenario(const char *title,
         printRow(r);
     }
     {
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
         auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
         printRow(r);
     }
@@ -1447,12 +1452,12 @@ static void runH5Scenario(const char *title,
         }
         // MPCGuider
         {
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
             Stats sDef = runCL("MPCGuider", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
             double defLate = lateRMSof(sDef), bestLate = defLate;
             std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
                 Stats s = runCL("MPCGuider", g, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
                 double late = lateRMSof(s);
                 if (late < bestLate) { bestLate = late; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
@@ -1483,7 +1488,7 @@ static void runH5Scenario(const char *title,
         printH5Row(r);
     }
     {
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
         auto r = runCL("MPCGuider", g, frames, exposure, 0.0, pe,
                        noiseSigma, SEED, steps, true);
         printH5Row(r);
@@ -1543,11 +1548,11 @@ static void runHarmonicScenario(const char *title,
         }
         // MPCGuider
         {
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
             Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
                 Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -1578,7 +1583,7 @@ static void runHarmonicScenario(const char *title,
         printRow(r, showDetrend);
     }
     {
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
         auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe,
                        noiseSigma, SEED, steps);
         printRow(r, showDetrend);
@@ -1645,11 +1650,11 @@ static void runDirectDriveScenario(const char *title,
             // the right time constant (otherwise default pure-integrator
             // plant assumes instant response and oscillates on sluggish
             // servos -- see DD4).
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setServoLag(dd.tau_servo); gd.setMinMove(0.1);
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::DirectDrive); gd.setParameters(10.0, 0.1); gd.setServoLag(dd.tau_servo); gd.setMinMove(0.1);
             Stats sDef = runCLDirectDrive("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::DirectDrive); g.setParameters(Q, R); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
                 Stats s = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -1679,7 +1684,7 @@ static void runDirectDriveScenario(const char *title,
         // No compliance declaration, no backlash setting -- see tune branch
         // comment above for why. Declare servo lag so MPC has the right
         // plant time constant.
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::DirectDrive); g.setParameters(10.0, 0.1); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
         auto r = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
         printRow(r);
     }
@@ -1739,11 +1744,11 @@ static void runStrainWaveScenario(const char *title,
             // No compliance declaration, no backlash. The controller has no
             // SW-aware plant yet (per-class tuning roadmap); rigid pure-
             // integrator is the default. Punch-through stays gated off.
-            MPCGuider gd("RA"); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
             Stats sDef = runCLStrainWave("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
             Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
             for (double Q : kMpcQ) for (double R : kMpcR) {
-                MPCGuider g("RA"); g.setParameters(Q, R); g.setMinMove(0.1);
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
                 Stats s = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
                 if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
             }
@@ -1770,7 +1775,7 @@ static void runStrainWaveScenario(const char *title,
         printRow(r);
     }
     {
-        MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
         auto r = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
         printRow(r);
     }
@@ -2178,6 +2183,63 @@ int main(int argc, char *argv[])
             300, 4.0, 0.0, 0.10, dd);
     }
 
+    // DD6: Same plant as DD4 (sluggish servo tau=1.5s) but MPCGuider is
+    // configured in Auto mode -- no setServoLag, no setMountType(DirectDrive).
+    // Demonstrates the bootstrap limitation of auto-detection: the
+    // detector samples (err(k) - err(k+1)) / u(k), which requires
+    // |u| > 0.5" and 0.05 < r < 0.95. On a fresh DD with the pure-
+    // integrator default plant, MPC oscillates immediately because its
+    // plant model assumes instant response. Oscillation produces r > 1
+    // (overshoot) or r < 0 (wrong direction), so samples are rejected
+    // and the detector never converges. Result: DD6 final RMS matches
+    // pre-setServoLag DD4 (~2.38"), not post-setServoLag DD4 (~0.41").
+    //
+    // Takeaway: auto-detection works for marginal cases (servo lag big
+    // enough to need tuning but not so big MPC blows up). The catastrophic
+    // case still needs manual setMountType(DirectDrive) + setServoLag, or
+    // a "safe default plant" enhancement to Auto mode (roadmap; needs
+    // careful design because it changes default behavior for all
+    // unconfigured callers).
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 1.5;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.05;
+        const char *title =
+            "DD6: DD + auto-detect  tau_servo=1.5s (hidden from MPC)  noise=0.10\"\n"
+            "    [MPCGuider in Auto mode -- no setServoLag; validates servo-lag auto-detection]";
+        const uint32_t SEED = 42;
+        const int frames = 300;
+        const double exposure = 4.0;
+        const double driftPerFrame = 0.0;
+        const double noiseSigma = 0.10;
+        {
+            LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+            auto r = runCLDirectDrive("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printHeader(title);
+            printRow(r);
+        }
+        {
+            HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+            auto r = runCLDirectDrive("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+        {
+            GaussianProcessGuider gpg(makeGPGParams(dd.ripple_T, true));
+            gpg.SetLearningRate(1.0);
+            auto r = runCLGPGDirectDrive("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+        {
+            // Explicit Auto for clarity (it is the default). No setServoLag
+            // -- servo-lag detection should figure out tau_servo from
+            // observed step response.
+            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::Auto); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            auto r = runCLDirectDrive("MPCGuider (Auto)", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+    }
+
     // ----- Strain-Wave (Harmonic Drive) Scenarios -----
     //
     // Models strain-wave mounts (ZWO HEM/AM3/AM5, iOptron HEM, etc.). Three
@@ -2363,7 +2425,7 @@ int main(int argc, char *argv[])
             printRow(r);
         }
         {
-            MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::Belt); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
             auto r = runCL2Mass("MPCGuider", g, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
             printRow(r);
         }
