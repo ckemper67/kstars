@@ -11,6 +11,7 @@
 
 #include "ekos/guide/internalguide/linearguider.h"
 #include "ekos/guide/internalguide/hysteresisguider.h"
+#include "ekos/guide/internalguide/mpcguider.h"
 #include "ekos/guide/internalguide/MPI_IS_gaussian_process/src/gaussian_process_guider.h"
 
 #include <QCoreApplication>
@@ -464,6 +465,8 @@ static const std::vector<double> kHystGain      = { 0.3, 0.5, 0.7, 0.9 };
 static const std::vector<double> kHystValue     = { 0.0, 0.2, 0.5 };
 static const std::vector<double> kGpgCtrlGain   = { 0.6, 0.8, 1.0 };
 static const std::vector<double> kGpgPKLengthSc = { 5.0, 10.0, 20.0 };
+static const std::vector<double> kMpcQ          = { 5.0, 10.0, 20.0, 50.0 };
+static const std::vector<double> kMpcR          = { 0.05, 0.1, 0.5, 1.0 };
 
 static void printTunedHeader(const char *title)
 {
@@ -1361,6 +1364,32 @@ static void runComplianceScenario(const char *title,
             }
             printTunedRow("GPG (learn)", sDef, sBest, bestP);
         }
+        // MPCGuider
+        {
+            auto configureMPC = [&](MPCGuider &mpc, double Q, double R) {
+                // runComplianceScenario serves worm-gear (WG7-WG17) and belt
+                // (B1-B2). Both gate the same way: harmonic detector on,
+                // servo-lag detector off. WormGear is the canonical pick.
+                mpc.setMountType(MPCGuider::MountType::WormGear);
+                if (declareCompliance)
+                    mpc.setParameters(Q, R, sim.Jm, sim.Bf, sim.Kt);
+                else
+                    mpc.setParameters(Q, R);
+                mpc.setMinMove(0.1);
+                if (sim.backlash > 0.0) mpc.setBacklash(sim.backlash);
+                if (declareCompliance && sim.Ks > 0.0 && sim.Ja > 0.0)
+                    mpc.setMechanicalParams(sim.Ks, sim.Bs, sim.Ja);
+            };
+            MPCGuider gd("RA"); configureMPC(gd, 10.0, 0.1);
+            Stats sDef = runCL2Mass("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); configureMPC(g, Q, R);
+                Stats s = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
         return;
     }
 
@@ -1379,6 +1408,47 @@ static void runComplianceScenario(const char *title,
         GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, gpgLearn));
         gpg.SetLearningRate(1.0);
         auto r = runCLGPG2Mass("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
+        printRow(r);
+    }
+    {
+        MPCGuider g("RA");
+        g.setMountType(MPCGuider::MountType::WormGear);
+        // When the caller has opted in to compliance declaration, pass the
+        // simulator's actual motor inertia and damping so the controller's
+        // plant model matches the rig. The default J=1e-6 assumes an
+        // effectively massless motor (rigid pure-integrator limit); for
+        // compliant 2-mass scenarios with a heavy motor this is wrong by
+        // orders of magnitude. Without declareCompliance the controller
+        // keeps its rigid pure-integrator approximation -- which is what
+        // WG7/WG8/WG16 relied on before the compliance routing was added; their
+        // 5-state flexible matrices are numerically unstable under
+        // 2nd-order Taylor discretization (Ks/Jm ratio too large at dt=2s).
+        if (declareCompliance)
+            g.setParameters(10.0, 0.1, sim.Jm, sim.Bf, sim.Kt);
+        else
+            g.setParameters(10.0, 0.1);
+        g.setMinMove(0.1);
+        // MPCSolver's punch-through now requires kPunchSustained=10 frames
+        // of sustained current_u direction before firing on a reversal, so
+        // it stays dormant under high-frequency PE (where reversals happen
+        // every ~PE_period/2/dt frames) and only fires when the cumulative
+        // command has held one side long enough that the gear gap really
+        // needs traversal.
+        if (sim.backlash > 0.0) g.setBacklash(sim.backlash);
+        // Declare compliance to the controller (opt-in per scenario). The
+        // 2-mass simulator already models finite Ks/Bs and a separate axis
+        // inertia; feeding those into MPCGuider builds the matching 5-state
+        // flexible plant instead of the rigid pure-integrator. Without this
+        // declaration, the controller assumes rigid coupling and issues
+        // catastrophically large corrections on stiff systems (WG17
+        // specifically). The opt-in is required because the existing
+        // 2nd-order Taylor discretization in TelescopePlant is unstable for
+        // Ks/Jm >> 1/dt^2 (typical worm-drive ratios with the default light
+        // motor); WG17 stays just inside the stability envelope because of
+        // its heavy direct-drive motor.
+        if (declareCompliance && sim.Ks > 0.0 && sim.Ja > 0.0)
+            g.setMechanicalParams(sim.Ks, sim.Bs, sim.Ja);
+        auto r = runCL2Mass("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, sim);
         printRow(r);
     }
 }
@@ -1442,6 +1512,18 @@ static void runScenario(const char *title,
             }
             printTunedRow("GPG", sDef, sBest, bestP);
         }
+        // MPCGuider sweep
+        {
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
         return;
     }
 
@@ -1460,6 +1542,11 @@ static void runScenario(const char *title,
         GaussianProcessGuider gpg(makeGPGParams(gpgPeriod, gpgLearn));
         gpg.SetLearningRate(1.0);
         auto r = runCLGPG("GPG", gpg, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
+        printRow(r);
+    }
+    {
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED);
         printRow(r);
     }
 }
@@ -1564,6 +1651,20 @@ static void runH5Scenario(const char *title,
             }
             printH5Tuned("GPG (learn)", defLate, bestLate, bestP);
         }
+        // MPCGuider
+        {
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+            double defLate = lateRMSof(sDef), bestLate = defLate;
+            std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, 0.0, pe, noiseSigma, SEED, steps, true);
+                double late = lateRMSof(s);
+                if (late < bestLate) { bestLate = late; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printH5Tuned("MPCGuider", defLate, bestLate, bestP);
+        }
         return;
     }
 
@@ -1585,6 +1686,12 @@ static void runH5Scenario(const char *title,
         gpg.SetLearningRate(1.0);
         auto r = runCLGPG("GPG (learn)", gpg, frames, exposure, 0.0, pe,
                           noiseSigma, SEED, steps, true);
+        printH5Row(r);
+    }
+    {
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, 0.0, pe,
+                       noiseSigma, SEED, steps, true);
         printH5Row(r);
     }
 }
@@ -1640,6 +1747,18 @@ static void runHarmonicScenario(const char *title,
             }
             printTunedRow("GPG (learn)", sDef, sBest, bestP);
         }
+        // MPCGuider
+        {
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCL("MPCGuider", gd, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe, noiseSigma, SEED, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
         return;
     }
 
@@ -1662,6 +1781,12 @@ static void runHarmonicScenario(const char *title,
         gpg.SetLearningRate(1.0);
         auto r = runCLGPG("GPG (learn)", gpg, frames, exposure, driftPerFrame, pe,
                           noiseSigma, SEED, steps);
+        printRow(r, showDetrend);
+    }
+    {
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCL("MPCGuider", g, frames, exposure, driftPerFrame, pe,
+                       noiseSigma, SEED, steps);
         printRow(r, showDetrend);
     }
 }
@@ -1718,6 +1843,24 @@ static void runDirectDriveScenario(const char *title,
             }
             printTunedRow("GPG (learn)", sDef, sBest, bestP);
         }
+        {
+            // DD has no compliance and no backlash: do NOT declare compliance to
+            // MPC and do NOT set backlash. Punch-through stays gated off
+            // (MPCSolver guards on backlash_ > 0.0). Declare the inner-servo
+            // tracking lag via setServoLag so MPC's rigid 3-state plant has
+            // the right time constant (otherwise default pure-integrator
+            // plant assumes instant response and oscillates on sluggish
+            // servos -- see DD4).
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::DirectDrive); gd.setParameters(10.0, 0.1); gd.setServoLag(dd.tau_servo); gd.setMinMove(0.1);
+            Stats sDef = runCLDirectDrive("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::DirectDrive); g.setParameters(Q, R); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
+                Stats s = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
         return;
     }
 
@@ -1736,6 +1879,14 @@ static void runDirectDriveScenario(const char *title,
         GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, true));
         gpg.SetLearningRate(1.0);
         auto r = runCLGPGDirectDrive("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
+        printRow(r);
+    }
+    {
+        // No compliance declaration, no backlash setting -- see tune branch
+        // comment above for why. Declare servo lag so MPC has the right
+        // plant time constant.
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::DirectDrive); g.setParameters(10.0, 0.1); g.setServoLag(dd.tau_servo); g.setMinMove(0.1);
+        auto r = runCLDirectDrive("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd, steps);
         printRow(r);
     }
 }
@@ -1790,6 +1941,20 @@ static void runStrainWaveScenario(const char *title,
             }
             printTunedRow("GPG (learn)", sDef, sBest, bestP);
         }
+        {
+            // No compliance declaration, no backlash. The controller has no
+            // SW-aware plant yet (per-class tuning roadmap); rigid pure-
+            // integrator is the default. Punch-through stays gated off.
+            MPCGuider gd("RA"); gd.setMountType(MPCGuider::MountType::WormGear); gd.setParameters(10.0, 0.1); gd.setMinMove(0.1);
+            Stats sDef = runCLStrainWave("MPCGuider", gd, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+            Stats sBest = sDef; std::string bestP = "Q=10 R=0.10";
+            for (double Q : kMpcQ) for (double R : kMpcR) {
+                MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(Q, R); g.setMinMove(0.1);
+                Stats s = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+                if (s.finalRMS < sBest.finalRMS) { sBest = s; bestP = fmtParams("Q=%.0f R=%.2f", Q, R); }
+            }
+            printTunedRow("MPCGuider", sDef, sBest, bestP);
+        }
         return;
     }
 
@@ -1808,6 +1973,11 @@ static void runStrainWaveScenario(const char *title,
         GaussianProcessGuider gpg(makeGPGParams(gpgInitPeriod, true));
         gpg.SetLearningRate(1.0);
         auto r = runCLGPGStrainWave("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
+        printRow(r);
+    }
+    {
+        MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+        auto r = runCLStrainWave("MPCGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, sw, steps);
         printRow(r);
     }
 }
@@ -1829,8 +1999,8 @@ int main(int argc, char *argv[])
         printf("Mode: TUNING (per-scenario parameter sweep, ~10 min)\n");
         printf("Each row shows the default-param result and the best from a small\n");
         printf("sweep. Sweeps: LinearGuider gain*length (4*3=12), HysteresisGuider\n");
-        printf("gain*hysteresis (4*3=12), GPG control_gain*PKLengthScale (3*3=9).\n");
-        printf("Pass without --tune for the fast benchmark.\n\n");
+        printf("gain*hysteresis (4*3=12), GPG control_gain*PKLengthScale (3*3=9),\n");
+        printf("MPCGuider Q*R (4*4=16). Pass without --tune for the fast benchmark.\n\n");
     } else {
         printf("Open RMS:  uncorrected mount error over all frames\n");
         printf("All RMS:   corrected residual, all frames (includes learning transient)\n");
@@ -1959,8 +2129,8 @@ int main(int argc, char *argv[])
         runComplianceScenario(
             "WG7: Torsional Compliance & Resonance + wind  T=30s  A1=4.0\" A2=1.6\" A3=0.8\""
             "  Ks=250.0  Bs=2.0  wind=0.03\"/s\n"
-            "    [Simulates torsional wind-up & resonant mount vibrations + light wind;"
-            " tests predictive cancellation]",
+            "    [Simulates torsional wind-up, resonant mount vibrations, and light wind;"
+            " MPC cancels pre-emptively]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
@@ -1975,7 +2145,7 @@ int main(int argc, char *argv[])
         sim.coulomb = 0.5;   // High Coulomb friction
         runComplianceScenario(
             "WG8: Static Friction + Compliance Wind-Up  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=200  stiction=1.5Nm\n"
-            "    [Simulates stiction stick-slip / deadband play; tests deadband-aware recovery]",
+            "    [Simulates stiction stick-slip / deadband play; MPC deadband punch-through suppresses wind-up]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
@@ -1993,7 +2163,7 @@ int main(int argc, char *argv[])
     // Real worms with single-tooth-pitch error look like sawtooth: linear
     // build-up then sharp return at the tooth-engagement transition.
     // FFT picks up the fundamental at T plus a Fourier comb 2T, 3T, ...;
-    // Demonstrates how algorithms handle harmonic content beyond their model.
+    // MPC's 2-oscillator IMP only models two of those harmonics.
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.waveform = PE_SAWTOOTH;
@@ -2017,7 +2187,7 @@ int main(int argc, char *argv[])
 
     // WG12: Half-rectified PE -- single-sided drive train error
     // Half-period zero, half-period sine. Strong DC + harmonic content. The
-    // Tests how algorithms respond to a DC bias overlaid on sinusoidal PE.
+    // MPC's IMP, which models pure sinusoidal d1/d2, cannot match the DC
     // component without help from the motor state.
     {
         PEParams pe;
@@ -2031,7 +2201,7 @@ int main(int argc, char *argv[])
     // WG13: True backlash (direction-dependent deadband)
     // Worm-and-wheel gear play: when motor reverses, axis stays put until
     // the +/- backlash gap is traversed. Different from WG4's hysteresis lag
-    // Backlash creates a signed asymmetry in the gear-mesh deflection
+    // (which is a signed force offset). MPCSolver has a backlash punch-through
     // path that triggers on commanded direction changes -- this scenario tests
     // it. Compliance is mild (Ks=400) so the backlash effect is isolated.
     {
@@ -2052,7 +2222,7 @@ int main(int argc, char *argv[])
     // WG14: Period drift -- worm period changes slowly over the run
     // Real harmonic-drive/worm-gear mounts drift in period with temperature.
     // ~1-5% per hour is typical. Test uses 10% drift over the run to make
-    // adaptation visible across the run; GPG re-fits its kernel,
+    // adaptation visible. MPC's FFT updates every 10 frames; GPG runs
     // gradient-based period inference. Both should adapt; the question is
     // how cleanly.
     // T0=30s, Tdot=0.0025 s/s -> T grows from 30s to ~33s over 1200s = 600 frames.
@@ -2061,7 +2231,7 @@ int main(int argc, char *argv[])
         pe.T = 30.0; pe.Tdot = 0.0025; pe.A1 = 4.0;
         runHarmonicScenario(
             "WG14: Period drift  T0=30s -> ~33s over 600 frames  A=4.0\"  noise=0.10\"\n"
-            "    [worm period drifts 10% over the run; tests period re-tracking across algorithms]",
+            "    [worm period drifts 10% over the run; tests FFT (MPC) vs gradient (GPG) re-tracking]",
             600, 2.0, 0.0, pe, 0.10, 30.0);
     }
 
@@ -2095,7 +2265,7 @@ int main(int argc, char *argv[])
         runComplianceScenario(
             "WG16: Slow worm + backlash  T=480s  A=5.0\"  Ks=400.0  backlash=1.0\"\n"
             "    [long-period PE so sustained direction holds; punch-through engages on each true reversal;\n"
-            "     simulates 2-mass flexible plant with declared compliance]",
+            "     MPC opts in to compliance declaration -> 5-state flexible plant]",
             360, 4.0, 0.0, pe, 0.10, 480.0, sim,
             /*gpgLearn=*/true,
             /*declareCompliance=*/true);
@@ -2124,7 +2294,7 @@ int main(int argc, char *argv[])
             "WG17: Slow-response motor + backlash  T=480s  A=5.0\"  Jm=0.5  backlash=2.0\"\n"
             "    [direct-drive style mount: motor takes several frames to settle;\n"
             "     gap traversal is a multi-frame event where punch-through should help;\n"
-            "     simulates 2-mass flexible plant with declared compliance]",
+            "     MPC opts in to compliance declaration -> 5-state flexible plant]",
             360, 4.0, 0.0, pe, 0.10, 480.0, sim,
             /*gpgLearn=*/true,
             /*declareCompliance=*/true);
@@ -2138,6 +2308,9 @@ int main(int argc, char *argv[])
     // dedicated single-state plant with a closed inner velocity servo;
     // cogging is injected as a rate disturbance (physically a torque, the
     // servo integrates it to position), wind as an OU rate disturbance.
+    // MPCGuider is configured without compliance declaration and without
+    // backlash, so its rigid pure-integrator plant matches the DD servo
+    // and the backlash punch-through stays gated off.
     printf("\n\n--- Direct Drive Scenarios ---\n");
 
     // DD1: Clean fast servo + tiny ripple. Easiest scenario in the suite;
@@ -2223,6 +2396,65 @@ int main(int argc, char *argv[])
             300, 4.0, 0.0, 0.10, dd);
     }
 
+    // DD6: Same plant as DD4 (sluggish servo tau=1.5s) but MPCGuider is
+    // configured in Auto mode -- no setServoLag, no setMountType(DirectDrive).
+    // Demonstrates the bootstrap limitation of auto-detection: the
+    // detector samples (err(k) - err(k+1)) / u(k), which requires
+    // |u| > 0.5" and 0.05 < r < 0.95. On a fresh DD with the pure-
+    // integrator default plant, MPC oscillates immediately because its
+    // plant model assumes instant response. Oscillation produces r > 1
+    // (overshoot) or r < 0 (wrong direction), so samples are rejected
+    // and the detector never converges. Result: DD6 final RMS matches
+    // pre-setServoLag DD4 (~2.38"), not post-setServoLag DD4 (~0.41").
+    //
+    // Takeaway: auto-detection works for marginal cases (servo lag big
+    // enough to need tuning but not so big MPC blows up). The catastrophic
+    // case still needs manual setMountType(DirectDrive) + setServoLag, or
+    // a "safe default plant" enhancement to Auto mode (roadmap; needs
+    // careful design because it changes default behavior for all
+    // unconfigured callers).
+    {
+        SimDirectDriveParams dd;
+        dd.tau_servo = 1.5;
+        dd.ripple_T  = 30.0;
+        dd.ripple_A1 = 0.05;
+        const char *title =
+            "DD6: DD + auto-detect  tau_servo=1.5s (hidden from MPC)  noise=0.10\"\n"
+            "    [MPCGuider in Auto mode -- no setServoLag; validates servo-lag auto-detection]";
+        const uint32_t SEED = 42;
+        const int frames = 300;
+        const double exposure = 4.0;
+        const double driftPerFrame = 0.0;
+        const double noiseSigma = 0.10;
+        {
+            LinearGuider g("RA"); g.setGain(0.7); g.setMinMove(0.1); g.setLength(25);
+            auto r = runCLDirectDrive("LinearGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printHeader(title);
+            printRow(r);
+        }
+        {
+            HysteresisGuider g("RA"); g.setGain(0.6); g.setHysteresis(0.1); g.setMinMove(0.1);
+            auto r = runCLDirectDrive("HysteresisGuider", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+        {
+            GaussianProcessGuider gpg(makeGPGParams(dd.ripple_T, true));
+            gpg.SetLearningRate(1.0);
+            auto r = runCLGPGDirectDrive("GPG (learn)", gpg, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+        {
+            // Explicit Auto for clarity (it is the default). No setServoLag
+            // -- detection or the Auto-mode safer-default plant handles
+            // this. setMountType must come AFTER setParameters because
+            // setParameters' J default is the pure-integrator limit, and
+            // setMountType installs the per-class plant default.
+            MPCGuider g("RA"); g.setParameters(10.0, 0.1); g.setMountType(MPCGuider::MountType::Auto); g.setMinMove(0.1);
+            auto r = runCLDirectDrive("MPCGuider (Auto)", g, frames, exposure, driftPerFrame, noiseSigma, SEED, dd);
+            printRow(r);
+        }
+    }
+
     // ----- Strain-Wave (Harmonic Drive) Scenarios -----
     //
     // Models strain-wave mounts (ZWO HEM/AM3/AM5, iOptron HEM, etc.). Three
@@ -2230,7 +2462,8 @@ int main(int argc, char *argv[])
     //   1. Motor-angle-indexed KE with dominant 2x harmonic
     //   2. Soft-zone torque-dependent stiffness (Ks_eff = tanh-saturated)
     //   3. Rate-independent (Dahl) hysteresis at direction reversals
-    // No deadband backlash.
+    // No deadband backlash. MPC configured rigid pure-integrator (per-class
+    // SW tuning is roadmap, not this PR).
     //
     // SW1-SW3 each isolate one feature; SW4 combines all three to expose
     // the soft-zone x hysteresis interaction that none of SW1-SW3 catches.
@@ -2410,6 +2643,11 @@ int main(int argc, char *argv[])
             auto r = runCLGPG2Mass("GPG (learn)", gpg, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
             printRow(r);
         }
+        {
+            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::Belt); g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            auto r = runCL2Mass("MPCGuider", g, 360, 4.0, 0.0, pe, 0.10, SEED, sim, slip);
+            printRow(r);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2459,6 +2697,12 @@ int main(int argc, char *argv[])
             auto r = runCLGPG("GPG (learn)", gpg, 360, 4.0, 0.0, pe, 0.30, SEED, {}, false, seeing);
             printRow(r);
         }
+        {
+            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear);
+            g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            auto r = runCL("MPCGuider", g, 360, 4.0, 0.0, pe, 0.30, SEED, {}, false, seeing);
+            printRow(r);
+        }
     }
 
     // S2: Same plant compliance as WG7 (resonant 2-mass) but with realistic
@@ -2493,6 +2737,12 @@ int main(int argc, char *argv[])
             GaussianProcessGuider gpg(makeGPGParams(30.0, true));
             gpg.SetLearningRate(1.0);
             auto r = runCLGPG2Mass("GPG (learn)", gpg, 400, 2.0, 0.0, pe, 0.10, SEED, sim, {}, false, seeing);
+            printRow(r);
+        }
+        {
+            MPCGuider g("RA"); g.setMountType(MPCGuider::MountType::WormGear);
+            g.setParameters(10.0, 0.1); g.setMinMove(0.1);
+            auto r = runCL2Mass("MPCGuider", g, 400, 2.0, 0.0, pe, 0.10, SEED, sim, {}, false, seeing);
             printRow(r);
         }
     }
