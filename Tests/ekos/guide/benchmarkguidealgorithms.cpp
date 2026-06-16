@@ -541,6 +541,7 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
     MeasState ms = makeMeasState(seed);
     uint32_t wind_seed = seed + 4000000u;
     double wind_2m = 0.0;
+    double wind_displacement = 0.0;   // cumulative open-loop wind contribution
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -563,7 +564,7 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
         theta_a += driftPerFrame;
         theta_m += driftPerFrame;
 
-        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
+        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start) + wind_displacement;
         sqOpen += openPos * openPos;
 
         double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
@@ -602,10 +603,15 @@ static Stats runCL2Mass(const std::string &name, Guider &g,
             omega_a += h * omega_a_dot;
 
             // Wind: OU rate disturbance directly on the axis position.
+            // Mirror the contribution into wind_displacement so the open-
+            // loop RMS includes wind alongside PE -- the algorithm should
+            // get credit for rejecting wind, not penalized for an open-
+            // loop reference that ignored it.
             if (sim.wind_sigma > 0.0)
             {
                 ddWindStep(wind_2m, sim.wind_tau, sim.wind_sigma, h, wind_seed);
                 theta_a += wind_2m * h;
+                wind_displacement += wind_2m * h;
             }
         }
 
@@ -635,6 +641,7 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
     MeasState ms = makeMeasState(seed);
     uint32_t wind_seed = seed + 4000000u;
     double wind_2m = 0.0;
+    double wind_displacement = 0.0;   // cumulative open-loop wind contribution
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -657,7 +664,7 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
         theta_a += driftPerFrame;
         theta_m += driftPerFrame;
 
-        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start);
+        double openPos = i * driftPerFrame + absHarmonicPE(peParams, t_start) + wind_displacement;
         sqOpen += openPos * openPos;
 
         double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
@@ -696,10 +703,15 @@ static Stats runCLGPG2Mass(const std::string &name, GaussianProcessGuider &gpg,
             omega_a += h * omega_a_dot;
 
             // Wind: OU rate disturbance directly on the axis position.
+            // Mirror the contribution into wind_displacement so the open-
+            // loop RMS includes wind alongside PE -- the algorithm should
+            // get credit for rejecting wind, not penalized for an open-
+            // loop reference that ignored it.
             if (sim.wind_sigma > 0.0)
             {
                 ddWindStep(wind_2m, sim.wind_tau, sim.wind_sigma, h, wind_seed);
                 theta_a += wind_2m * h;
+                wind_displacement += wind_2m * h;
             }
         }
 
@@ -1078,6 +1090,7 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
     MeasState ms = makeMeasState(seed);
     uint32_t wind_seed = seed + 4000000u;
     double wind_2m = 0.0;
+    double wind_displacement = 0.0;   // cumulative open-loop wind contribution
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -1118,7 +1131,7 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
         const double frame_KE = swKE(sw, motor_abs);
         // Open-loop reference: an uncorrected mount would lag the motor by
         // KE(open_motor); residual axis = -KE(open_motor). Drift adds on top.
-        const double open_residual = open_pos - swKE(sw, open_motor);
+        const double open_residual = open_pos - swKE(sw, open_motor) + wind_displacement;
         sqOpen += open_residual * open_residual;
 
         const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
@@ -1162,10 +1175,13 @@ static Stats runCLStrainWave(const std::string &name, Guider &g,
             T_prev = T_spring;
 
             // Wind: OU rate disturbance directly on the axis position.
+            // Mirror into wind_displacement so the open-loop reference
+            // includes wind (see runCL2Mass comment).
             if (sw.wind_sigma > 0.0)
             {
                 ddWindStep(wind_2m, sw.wind_tau, sw.wind_sigma, h_dt, wind_seed);
                 theta_a += wind_2m * h_dt;
+                wind_displacement += wind_2m * h_dt;
             }
         }
 
@@ -1196,6 +1212,7 @@ static Stats runCLGPGStrainWave(const std::string &name,
     MeasState ms = makeMeasState(seed);
     uint32_t wind_seed = seed + 4000000u;
     double wind_2m = 0.0;
+    double wind_displacement = 0.0;   // cumulative open-loop wind contribution
     double theta_m = 0.0;
     double omega_m = 0.0;
     double theta_a = 0.0;
@@ -1227,7 +1244,7 @@ static Stats runCLGPGStrainWave(const std::string &name,
         const double motor_abs  = i * SIDEREAL * exposure + theta_m;
         const double open_motor = i * SIDEREAL * exposure;
         const double frame_KE = swKE(sw, motor_abs);
-        const double open_residual = open_pos - swKE(sw, open_motor);
+        const double open_residual = open_pos - swKE(sw, open_motor) + wind_displacement;
         sqOpen += open_residual * open_residual;
 
         const double meas = theta_a + measurementNoise(ms, mp, noiseSigma, exposure);
@@ -1267,10 +1284,13 @@ static Stats runCLGPGStrainWave(const std::string &name,
             T_prev = T_spring;
 
             // Wind: OU rate disturbance directly on the axis position.
+            // Mirror into wind_displacement so the open-loop reference
+            // includes wind (see runCL2Mass comment).
             if (sw.wind_sigma > 0.0)
             {
                 ddWindStep(wind_2m, sw.wind_tau, sw.wind_sigma, h_dt, wind_seed);
                 theta_a += wind_2m * h_dt;
+                wind_displacement += wind_2m * h_dt;
             }
         }
 
@@ -1925,7 +1945,7 @@ int main(int argc, char *argv[])
             600, 2.0, 0.05, pe, 0.25, 100.0, true);
     }
 
-    // WG7: Torsional Compliance & Resonance
+    // WG7: Torsional Compliance & Resonance with light wind
     {
         PEParams pe;
         pe.T = 30.0; pe.A1 = 4.0; pe.A2 = 1.6; pe.A3 = 0.8;
@@ -1934,9 +1954,13 @@ int main(int argc, char *argv[])
         sim.Bs = 2.0;   // Moderate damping
         sim.stiction = 0.0; // Clean compliance
         sim.coulomb = 0.0;
+        sim.wind_tau   = 30.0;  // OU correlation time
+        sim.wind_sigma = 0.03;  // arcsec/s -- light wind on a compliant plant
         runComplianceScenario(
-            "WG7: Torsional Compliance & Resonance  T=30s  A1=4.0\" A2=1.6\" A3=0.8\"  Ks=250.0  Bs=2.0\n"
-            "    [Simulates torsional wind-up & resonant mount vibrations; tests predictive cancellation]",
+            "WG7: Torsional Compliance & Resonance + wind  T=30s  A1=4.0\" A2=1.6\" A3=0.8\""
+            "  Ks=250.0  Bs=2.0  wind=0.03\"/s\n"
+            "    [Simulates torsional wind-up & resonant mount vibrations + light wind;"
+            " tests predictive cancellation]",
             400, 2.0, 0.0, pe, 0.10, 100.0, sim);
     }
 
@@ -2117,14 +2141,18 @@ int main(int argc, char *argv[])
     printf("\n\n--- Direct Drive Scenarios ---\n");
 
     // DD1: Clean fast servo + tiny ripple. Easiest scenario in the suite;
-    // all algorithms should track to near the noise floor.
+    // all algorithms should track to near the noise floor. The realistic
+    // pulse-train command model (pulse_rate ~ 0.5x sidereal = 7.5"/s) is
+    // used in DD1-DD5 so corrections complete in a small fraction of the
+    // exposure, matching real DD mounts.
     {
         SimDirectDriveParams dd;
         dd.tau_servo = 0.3;
         dd.ripple_T  = 30.0;
         dd.ripple_A1 = 0.02;     // arcsec/s -- ~0.1" peak position-equivalent
+        dd.pulse_rate = 7.5;     // ~0.5x sidereal: realistic guide-pulse rate
         runDirectDriveScenario(
-            "DD1: Clean DD  tau_servo=0.3s  ripple_T=30s  A1=0.02\"/s  noise=0.10\"\n"
+            "DD1: Clean DD  tau_servo=0.3s  ripple_T=30s  A1=0.02\"/s  pulse=7.5\"/s  noise=0.10\"\n"
             "    [fast inner servo + tiny cogging; baseline DD performance]",
             300, 4.0, 0.0, 0.10, dd);
     }
@@ -2140,8 +2168,9 @@ int main(int argc, char *argv[])
         dd.ripple_A1 = 0.08;
         dd.ripple_A2 = 0.03;
         dd.ripple_A3 = 0.015;
+        dd.pulse_rate = 7.5;
         runDirectDriveScenario(
-            "DD2: DD + cogging harmonics  ripple_T=30s  A1=0.08 A2=0.03 A3=0.015\"/s  noise=0.10\"\n"
+            "DD2: DD + cogging harmonics  ripple_T=30s  A1=0.08 A2=0.03 A3=0.015\"/s  pulse=7.5\"/s  noise=0.10\"\n"
             "    [repeatable torque ripple with 2nd/3rd harmonics; GPG should learn it]",
             300, 4.0, 0.0, 0.10, dd);
     }
@@ -2154,8 +2183,9 @@ int main(int argc, char *argv[])
         dd.ripple_T  = 0.0;
         dd.wind_tau   = 20.0;
         dd.wind_sigma = 0.15;   // arcsec/s rate disturbance
+        dd.pulse_rate = 7.5;
         runDirectDriveScenario(
-            "DD3: DD + wind OU  tau=20s  sigma=0.15\"/s  noise=0.10\"\n"
+            "DD3: DD + wind OU  tau=20s  sigma=0.15\"/s  pulse=7.5\"/s  noise=0.10\"\n"
             "    [no repeatable structure; pure disturbance-rejection test, GPG cannot learn]",
             300, 4.0, 0.0, 0.10, dd);
     }
@@ -2168,8 +2198,9 @@ int main(int argc, char *argv[])
         dd.tau_servo = 1.5;
         dd.ripple_T  = 30.0;
         dd.ripple_A1 = 0.05;
+        dd.pulse_rate = 7.5;
         runDirectDriveScenario(
-            "DD4: Sluggish DD servo  tau_servo=1.5s  ripple_T=30s  A1=0.05\"/s  noise=0.10\"\n"
+            "DD4: Sluggish DD servo  tau_servo=1.5s  ripple_T=30s  A1=0.05\"/s  pulse=7.5\"/s  noise=0.10\"\n"
             "    [slow inner loop: correction takes several seconds to settle;\n"
             "     aggressive gains may oscillate]",
             300, 4.0, 0.0, 0.10, dd);
@@ -2185,8 +2216,9 @@ int main(int argc, char *argv[])
         dd.mode_hz   = 6.0;    // well above guide Nyquist -> aliased
         dd.mode_zeta = 0.05;
         dd.mode_A    = 0.05;
+        dd.pulse_rate = 7.5;
         runDirectDriveScenario(
-            "DD5: DD + structural mode  mode=6Hz zeta=0.05 A=0.05\"  noise=0.10\"\n"
+            "DD5: DD + structural mode  mode=6Hz zeta=0.05 A=0.05\"  pulse=7.5\"/s  noise=0.10\"\n"
             "    [under-damped mount resonance aliased into the guide band; nothing should blow up]",
             300, 4.0, 0.0, 0.10, dd);
     }
@@ -2204,9 +2236,10 @@ int main(int argc, char *argv[])
     // the soft-zone x hysteresis interaction that none of SW1-SW3 catches.
     printf("\n\n--- Strain-Wave Drive Scenarios ---\n");
 
-    // SW1: Clean SW. Moderate KE, high enough load that the system sits in
-    // the stiff regime. The 2x-per-motor-rev signature should dominate the
-    // residual; soft-zone and hysteresis stay quiet.
+    // SW1: Clean SW with light wind. Moderate KE, high enough load that the
+    // system sits in the stiff regime. The 2x-per-motor-rev signature should
+    // dominate the residual; soft-zone and hysteresis stay quiet. Light
+    // wind makes the baseline closer to a real outdoor session.
     {
         SimStrainWaveParams sw;
         sw.T_KE = 60.0;
@@ -2214,9 +2247,12 @@ int main(int argc, char *argv[])
         sw.A0 = 0.3;  // small bearing-eccentricity sub-harmonic
         sw.h_max = 0.02;  // tiny: keep hysteresis dormant in SW1
         sw.Kh = 10.0;
+        sw.wind_tau   = 30.0;
+        sw.wind_sigma = 0.03;  // arcsec/s -- light wind
         runStrainWaveScenario(
-            "SW1: Clean SW  T_KE=60s  A1=3.0\" A2=0.8\" A3=0.2\" A0=0.3\"  noise=0.10\"\n"
-            "    [stiff regime; 2x-per-motor-rev KE signature dominates residual]",
+            "SW1: Clean SW + light wind  T_KE=60s  A1=3.0\" A2=0.8\" A3=0.2\" A0=0.3\""
+            "  wind=0.03\"/s  noise=0.10\"\n"
+            "    [stiff regime; 2x-per-motor-rev KE + light wind dominates residual]",
             300, 4.0, 0.0, 0.10, sw);
     }
 
