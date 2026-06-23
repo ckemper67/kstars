@@ -5,10 +5,10 @@ import re
 import argparse
 import sqlite3
 
-# Valid KStars DMS format: leading ' ' (positive) or '-' (negative),
+# Valid KStars DMS format: optional leading ' ' (positive) or '-' (negative),
 # then digits, degree symbol, space, minutes, quote, seconds, double-quote.
-# Example: " 37° 20' 26\""  or "-22° 54' 30\""
-_DMS_RE = re.compile(r'^[ -]\d+\xb0 \d+\' \d+"$')
+# Example: " 37° 20' 26\"", "37° 20' 26\"", or "-22° 54' 30\""
+_DMS_RE = re.compile(r'^[ -]?\d+\xb0 \d+\' \d+"$')
 
 def _warn(msg):
     print("WARNING: " + msg, file=sys.stderr)
