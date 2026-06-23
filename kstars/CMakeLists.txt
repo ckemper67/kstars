@@ -379,6 +379,7 @@ if (INDI_FOUND)
             ekos/align/polaralign.cpp
             ekos/align/rotations.cpp
             ekos/align/mountmodel.cpp
+            ekos/align/alignorderoptimization.cpp
             ekos/align/polaralignmentassistant.cpp
             ekos/align/manualrotator.cpp
             ekos/align/polaralignwidget.cpp
