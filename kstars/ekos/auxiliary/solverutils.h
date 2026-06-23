@@ -51,23 +51,29 @@ class SolverUtils : public QObject
             if (!m_StellarSolver) return *new FITSImage::Background();
             return m_StellarSolver->getBackground();
         }
-        const QList<FITSImage::Star> &getStarList() const
+    const QList<FITSImage::Star> &getStarList() const
         {
             // Better leak than crash. Warn?
             if (!m_StellarSolver) return *new QList<FITSImage::Star>();
             return m_StellarSolver->getStarList();
         }
-        int getNumStarsFound() const
+    int getNumStarsFound() const
         {
             if (!m_StellarSolver) return 0;
             return m_StellarSolver->getNumStarsFound();
         };
 
-        static void patchMultiAlgorithm(StellarSolver *solver);
+    static void patchMultiAlgorithm(StellarSolver *solver);
 
         // Override the multi-algorithm selection for testing.
-        static void setMultiAlgorithmOverride(int algo) { s_MultiAlgorithmOverride = algo; }
-        static void clearMultiAlgorithmOverride() { s_MultiAlgorithmOverride = -1; }
+        static void setMultiAlgorithmOverride(int algo)
+        {
+            s_MultiAlgorithmOverride = algo;
+        }
+        static void clearMultiAlgorithmOverride()
+        {
+            s_MultiAlgorithmOverride = -1;
+        }
 
     Q_SIGNALS:
         void done(bool timedOut, bool success, const FITSImage::Solution &solution, double elapsedSeconds);

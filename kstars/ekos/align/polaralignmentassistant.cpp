@@ -1279,10 +1279,10 @@ void PolarAlignmentAssistant::setMountStatus(ISD::Mount::Status newState)
 QString PolarAlignmentAssistant::getPAHMessage() const
 {
     switch (m_PAHStage)
-    {
-        case PAH_IDLE:
-        case PAH_FIND_CP:
-            return introText->text();
+{
+    case PAH_IDLE:
+    case PAH_FIND_CP:
+        return introText->text();
         case PAH_FIRST_CAPTURE:
             return i18n("<p>The assistant requires three images to find a solution.  Ekos is now capturing the first image...</p>");
         case PAH_FIRST_SOLVE:

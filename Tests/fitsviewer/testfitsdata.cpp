@@ -491,9 +491,9 @@ void TestFitsData::testSEPAlgorithmBenchmark()
 QString SolverLoop::status() const
 {
     return QString("%1/%2 %3% %4 %5")
-           .arg(upto()).arg(repetitions).arg(upto() * 100.0 / repetitions, 2, 'f', 0)
-           .arg(solver.get() && solver->isRunning() ? " running" : "")
-           .arg(done() ? " Done" : "");
+    .arg(upto()).arg(repetitions).arg(upto() * 100.0 / repetitions, 2, 'f', 0)
+    .arg(solver.get() && solver->isRunning() ? " running" : "")
+    .arg(done() ? " Done" : "");
 }
 
 SolverLoop::SolverLoop(const QVector<QString> &files, const QString &dir, bool isDetecting, int numReps)
@@ -649,7 +649,8 @@ static bool ensureIndexFiles()
 {
     if (Options::astrometryIndexFolderList().isEmpty())
     {
-        const QStringList candidates = {
+        const QStringList candidates =
+        {
             QDir::homePath() + "/Library/Application Support/kstars/astrometry",
             QDir::homePath() + "/.local/share/kstars/astrometry",
         };

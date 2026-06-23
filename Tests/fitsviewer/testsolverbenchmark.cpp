@@ -36,7 +36,8 @@ bool TestSolverBenchmark::ensureIndexFiles()
 {
     if (Options::astrometryIndexFolderList().isEmpty())
     {
-        const QStringList candidates = {
+        const QStringList candidates =
+        {
             QDir::homePath() + "/Library/Application Support/kstars/astrometry",
             QDir::homePath() + "/.local/share/kstars/astrometry",
         };
@@ -83,12 +84,13 @@ bool TestSolverBenchmark::solveField(QSharedPointer<FITSData> image,
     double elapsed = 0;
 
     connect(solver.get(), &SolverUtils::done, this,
-            [&](bool timedOut, bool ok, const FITSImage::Solution &sol, double secs) {
-                finished = true;
-                success = !timedOut && ok;
-                solution = sol;
-                elapsed = secs;
-            });
+            [&](bool timedOut, bool ok, const FITSImage::Solution & sol, double secs)
+    {
+        finished = true;
+        success = !timedOut && ok;
+        solution = sol;
+        elapsed = secs;
+    });
 
     solver->runSolver(image);
 
@@ -103,8 +105,8 @@ bool TestSolverBenchmark::solveField(QSharedPointer<FITSData> image,
     if (!finished || !success)
     {
         qInfo() << QString("  %1  TIMEOUT (%2s)")
-                       .arg(label, -14)
-                       .arg(timeoutSecs);
+                .arg(label, -14)
+                .arg(timeoutSecs);
         return false;
     }
 
@@ -113,10 +115,10 @@ bool TestSolverBenchmark::solveField(QSharedPointer<FITSData> image,
     double decDiff = std::abs(solution.dec - dec);
 
     qInfo() << QString("  %1  %2s  scale %3  error %4 deg")
-                   .arg(label, -14)
-                   .arg(elapsed, 5, 'f', 2)
-                   .arg(solution.pixscale, 0, 'f', 3)
-                   .arg(std::sqrt(raDiff * raDiff + decDiff * decDiff), 0, 'f', 4);
+            .arg(label, -14)
+            .arg(elapsed, 5, 'f', 2)
+            .arg(solution.pixscale, 0, 'f', 3)
+            .arg(std::sqrt(raDiff * raDiff + decDiff * decDiff), 0, 'f', 4);
 
     return (raDiff < 0.5 && decDiff < 0.5);
 }
@@ -166,28 +168,47 @@ void TestSolverBenchmark::benchmarkRenderedField()
     const int sepStars = image->getDetectedStars();
 
     qInfo() << QString("%1 (%2): RA %3, Dec %4, scale %5 arcsec/px, %6 SEP stars (default settings)")
-                   .arg(label)
-                   .arg(filename)
-                   .arg(ra, 0, 'f', 4)
-                   .arg(dec, 0, 'f', 4)
-                   .arg(pixscale, 0, 'f', 4)
-                   .arg(sepStars);
+            .arg(label)
+            .arg(filename)
+            .arg(ra, 0, 'f', 4)
+            .arg(dec, 0, 'f', 4)
+            .arg(pixscale, 0, 'f', 4)
+            .arg(sepStars);
 
     auto profiles = Ekos::getDefaultAlignOptionsProfiles();
     auto base = profiles.at(3);
 
-    struct { int keepNum; double minwidth; double maxwidth; QString name; } configs[] = {
+    struct
+    {
+        int keepNum;
+        double minwidth;
+        double maxwidth;
+        QString name;
+    } configs[] =
+    {
         { 50, 0.1, 10.0, "keepNum=50 0.1-10deg" },
         {  0, 0.1, 10.0, "keepNum=0  0.1-10deg" },
         { 50, 0.0,  0.0, "keepNum=50 no-scale"  },
     };
 
-    struct { int algo; QString name; } algorithms[] = {
+    struct
+    {
+        int algo;
+        QString name;
+    } algorithms[] =
+    {
         { SSolver::MULTI_SCALES,    "MULTI_SCALES" },
         { SSolver::MULTI_DEPTHS,    "MULTI_DEPTHS" },
     };
 
-    struct { bool scale; bool position; int timeout; QString name; } hints[] = {
+    struct
+    {
+        bool scale;
+        bool position;
+        int timeout;
+        QString name;
+    } hints[] =
+    {
         { true,  true,  20, "scale+pos" },
         { true,  false, 30, "scale"     },
         { false, true,  30, "pos"       },
