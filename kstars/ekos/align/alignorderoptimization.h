@@ -67,4 +67,33 @@ std::vector<int> alignOrderOptimization(
     double lst_h,
     double flipPenaltyDeg = ALIGN_FLIP_PENALTY_DEG);
 
+/**
+ * @brief Two-phase equatorial sort guaranteeing coverage of both GEM pier sides.
+ *
+ * Partitions points into east (HA < 0) and west (HA >= 0) halves, optimizes
+ * each half independently using alignOrderOptimization (no flip penalty within
+ * a half), then joins them with a single pier flip.
+ *
+ * Handoff optimization: each half is a reversible open path. All four
+ * combinations of traversal direction (first_fwd/rev x second_fwd/rev) are
+ * evaluated and the pair that minimizes the two boundary-edge costs is chosen.
+ * This is O(1) extra work once both half-tours are built.
+ *
+ * Falls back to alignOrderOptimization(flipPenaltyDeg=0) when all points fall
+ * on one pier side.
+ *
+ * For alt-az mounts use alignOrderOptimization(isAltAz=true) instead.
+ *
+ * @param pts    Pre-parsed alignment points.
+ * @param start  Starting position in the same format as pts.
+ * @param lst_h  Local sidereal time in hours.
+ * @return       Permutation: result[k] is the index into pts[] to visit at step k.
+ *               No flip sentinel is inserted -- the caller detects the pier
+ *               transition when the HA sign changes between consecutive points.
+ */
+std::vector<int> alignOrderOptimizationTwoPhase(
+    const std::vector<AlignOrderPoint> &pts,
+    const AlignOrderPoint &start,
+    double lst_h);
+
 } // namespace Ekos

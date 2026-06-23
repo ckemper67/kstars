@@ -38,6 +38,12 @@
  *   7. Production/AA  -- alignOrderOptimization(isAltAz=true): same algorithm with
  *                        the Alt/Az axis metric.
  *
+ *   8. Two-phase EQ   -- alignOrderOptimizationTwoPhase: partition east/west, run
+ *                        the full local search on each half independently (no flip
+ *                        penalty within a half), pick the best of 4 direction
+ *                        combinations for the inter-half handoff, join with one
+ *                        implicit flip.  Guarantees coverage of both pier sides.
+ *
  * The cross-evaluation matrix shows total axis travel (degrees) for each sort
  * order measured under each physical metric, with deltas vs Angular baseline.
  * This reveals what happens if you use the wrong sort for your mount type, and
@@ -357,20 +363,18 @@ static int countFlips(const std::vector<int> &order,
     return flips;
 }
 
-// ---- Wrap alignOrderOptimization output into SortResult -----------------------
+// ---- Wrap sort output into SortResult -----------------------------------------
 //
-// alignOrderOptimization returns a bare order vector; this helper computes the
-// per-leg distances under a given metric so it can slot into the cross-eval
-// matrix alongside the greedy results.
-static SortResult productionSortResult(const std::vector<AlignOrderPoint> &pts,
-                                       const AlignOrderPoint &start,
-                                       bool isAltAz,
-                                       double lst_h,
-                                       const Metric &metric,
-                                       double flipPenaltyDeg = 0.0)
+// These helpers compute per-leg distances under a given metric so the result
+// can slot into the cross-eval matrix alongside the greedy-only results.
+
+static SortResult orderToResult(const std::vector<int> &order,
+                                const std::vector<AlignOrderPoint> &pts,
+                                const AlignOrderPoint &start,
+                                const Metric &metric)
 {
     SortResult r;
-    r.order = Ekos::alignOrderOptimization(pts, start, isAltAz, lst_h, flipPenaltyDeg);
+    r.order = order;
     const AlignOrderPoint *prev = &start;
     for (int idx : r.order)
     {
@@ -378,6 +382,70 @@ static SortResult productionSortResult(const std::vector<AlignOrderPoint> &pts,
         r.legs.push_back(d);
         r.total += d;
         prev = &pts[idx];
+    }
+    return r;
+}
+
+static SortResult productionSortResult(const std::vector<AlignOrderPoint> &pts,
+                                       const AlignOrderPoint &start,
+                                       bool isAltAz,
+                                       double lst_h,
+                                       const Metric &metric,
+                                       double flipPenaltyDeg = 0.0)
+{
+    return orderToResult(
+        Ekos::alignOrderOptimization(pts, start, isAltAz, lst_h, flipPenaltyDeg),
+        pts, start, metric);
+}
+
+static SortResult twoPhaseSortResult(const std::vector<AlignOrderPoint> &pts,
+                                     const AlignOrderPoint &start,
+                                     double lst_h,
+                                     const Metric &metric,
+                                     double flipPenaltyDeg)
+{
+    const auto order = Ekos::alignOrderOptimizationTwoPhase(pts, start, lst_h);
+
+    // Locate the single pier-side transition and insert a -1 sentinel so that
+    // crossEvaluate adds the flip penalty correctly.  The transition may occur
+    // at exactly HA=0, which the strict haA*haB<0 check would miss.
+    std::vector<int> withSentinel;
+    withSentinel.reserve(order.size() + 1);
+    bool sentinelInserted = false;
+    const AlignOrderPoint *prev = &start;
+    for (int idx : order)
+    {
+        if (!sentinelInserted)
+        {
+            double haP = rangeHA(lst_h - prev->ra_h);
+            double haC = rangeHA(lst_h - pts[idx].ra_h);
+            if ((haP >= 0.0) != (haC >= 0.0))
+            {
+                withSentinel.push_back(-1);
+                sentinelInserted = true;
+            }
+        }
+        withSentinel.push_back(idx);
+        prev = &pts[idx];
+    }
+
+    SortResult r;
+    r.order = withSentinel;
+    prev = &start;
+    for (int idx : withSentinel)
+    {
+        if (idx == -1)
+        {
+            r.legs.push_back(flipPenaltyDeg);
+            r.total += flipPenaltyDeg;
+        }
+        else
+        {
+            double d = metric(*prev, pts[idx]);
+            r.legs.push_back(d);
+            r.total += d;
+            prev = &pts[idx];
+        }
     }
     return r;
 }
@@ -492,7 +560,7 @@ int main()
 
     const Metric gemMetric = makeMetricGEM(LST_H, FLIP_PENALTY_DEG);
 
-    // Run all seven scenarios.
+    // Run all eight scenarios.
     const auto r1 = nearestNeighborSort(points, startPos, metricAngular);
     const auto r2 = nearestNeighborSort(points, startPos, gemMetric);
     const auto r3 = nearestNeighborSort(points, startPos, metricAltAz);
@@ -501,6 +569,8 @@ int main()
     // Production sort: greedy + 2-opt + Or-opt-1, measured under its native metric.
     const auto r6 = productionSortResult(points, startPos, false, LST_H, gemMetric, FLIP_PENALTY_DEG);
     const auto r7 = productionSortResult(points, startPos, true,  LST_H, metricAltAz);
+    // Two-phase: east half + west half, each fully locally-optimized, joined with one flip.
+    const auto r8 = twoPhaseSortResult(points, startPos, LST_H, gemMetric, FLIP_PENALTY_DEG);
 
     printResult("Angular Distance (sky great-circle)", r1, SLEW_RATE);
     printResult("GEM: max(|dHA|*15, |dDec|) + flip",  r2, SLEW_RATE);
@@ -509,6 +579,7 @@ int main()
     printResult("Pier-side (two-phase, one flip)",     r5, SLEW_RATE);
     printResult("Production EQ (greedy+2opt+oropt1)",  r6, SLEW_RATE);
     printResult("Production AA (greedy+2opt+oropt1)",  r7, SLEW_RATE);
+    printResult("Two-phase EQ (both sides, one flip)", r8, SLEW_RATE);
 
     // Cross-evaluation matrix.
     struct Scenario   { std::string name; const SortResult *r; };
@@ -522,6 +593,7 @@ int main()
         {"Pier-side sort",  &r5},
         {"Production EQ",   &r6},
         {"Production AA",   &r7},
+        {"Two-phase EQ",    &r8},
     };
     const MeasureDef measures[] = {
         {"Angular (deg)",    metricAngular},

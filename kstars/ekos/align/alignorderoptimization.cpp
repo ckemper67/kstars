@@ -230,4 +230,102 @@ std::vector<int> alignOrderOptimization(
     return order;
 }
 
+// ---- Two-phase pier-coverage sort -------------------------------------------
+
+std::vector<int> alignOrderOptimizationTwoPhase(
+    const std::vector<AlignOrderPoint> &pts,
+    const AlignOrderPoint              &start,
+    double                              lst_h)
+{
+    const int n = static_cast<int>(pts.size());
+    if (n == 0)
+        return {};
+
+    // Cost within a single pier side (no flip penalty).
+    auto cost = [&](const AlignOrderPoint &a, const AlignOrderPoint &b) -> double
+    {
+        const double haA = rangeHours(lst_h - a.ra_h);
+        const double haB = rangeHours(lst_h - b.ra_h);
+        return std::max(std::abs(haA - haB) * 15.0,
+                        std::abs(a.dec_deg - b.dec_deg));
+    };
+
+    // Partition by pier side: 0 = east (HA < 0), 1 = west (HA >= 0).
+    std::vector<int> sideIdx[2];
+    for (int i = 0; i < n; ++i)
+        sideIdx[rangeHours(lst_h - pts[i].ra_h) < 0.0 ? 0 : 1].push_back(i);
+
+    // Fall back when all points are on one pier side.
+    if (sideIdx[0].empty() || sideIdx[1].empty())
+        return alignOrderOptimization(pts, start, false, lst_h, 0.0);
+
+    // Build local point arrays for each side.
+    std::vector<AlignOrderPoint> sidePts[2];
+    for (int s = 0; s < 2; ++s)
+        for (int i : sideIdx[s])
+            sidePts[s].push_back(pts[i]);
+
+    // Pick which side to visit first (the one with the nearest point to start).
+    double nearCost[2] = { 1e9, 1e9 };
+    for (int s = 0; s < 2; ++s)
+        for (const auto &p : sidePts[s])
+            nearCost[s] = std::min(nearCost[s], cost(start, p));
+    const int A = (nearCost[0] <= nearCost[1]) ? 0 : 1;
+    const int B = 1 - A;
+
+    // Optimize first half from start; the greedy step picks A[0] as the entry
+    // nearest to start and builds toward A[n-1] at the far end.
+    const auto orderA = alignOrderOptimization(sidePts[A], start, false, lst_h, 0.0);
+    const AlignOrderPoint &A_entry = sidePts[A][orderA.front()];
+    const AlignOrderPoint &A_exit  = sidePts[A][orderA.back()];
+
+    // Optimize second half from each potential handoff point:
+    //   orderB_e: B built from A_exit  (used when A is traversed forward)
+    //   orderB_n: B built from A_entry (used when A is traversed in reverse,
+    //             so A_entry becomes the exit point handed to B)
+    const auto orderB_e = alignOrderOptimization(sidePts[B], A_exit,  false, lst_h, 0.0);
+    const auto orderB_n = alignOrderOptimization(sidePts[B], A_entry, false, lst_h, 0.0);
+
+    // Evaluate 4 handoff combinations.  Internal tour costs are direction-
+    // independent; only the two boundary edges differ.
+    //   0: A_fwd + B_e_fwd  -- start->A_entry ... A_exit->B_e[0]
+    //   1: A_fwd + B_e_rev  -- start->A_entry ... A_exit->B_e[m-1]
+    //   2: A_rev + B_n_fwd  -- start->A_exit  ... A_entry->B_n[0]
+    //   3: A_rev + B_n_rev  -- start->A_exit  ... A_entry->B_n[m-1]
+    const double combCost[4] = {
+        cost(start, A_entry) + cost(A_exit,  sidePts[B][orderB_e.front()]),
+        cost(start, A_entry) + cost(A_exit,  sidePts[B][orderB_e.back()]),
+        cost(start, A_exit)  + cost(A_entry, sidePts[B][orderB_n.front()]),
+        cost(start, A_exit)  + cost(A_entry, sidePts[B][orderB_n.back()]),
+    };
+    int best = 0;
+    for (int i = 1; i < 4; ++i)
+        if (combCost[i] < combCost[best])
+            best = i;
+
+    const bool A_reversed = (best >= 2);
+    const bool B_reversed = (best == 1 || best == 3);
+    const auto &orderB    = (best < 2) ? orderB_e : orderB_n;
+
+    // Build result as global indices.
+    std::vector<int> result;
+    result.reserve(n);
+
+    if (!A_reversed)
+        for (int i : orderA)
+            result.push_back(sideIdx[A][i]);
+    else
+        for (int k = static_cast<int>(orderA.size()) - 1; k >= 0; --k)
+            result.push_back(sideIdx[A][orderA[k]]);
+
+    if (!B_reversed)
+        for (int i : orderB)
+            result.push_back(sideIdx[B][i]);
+    else
+        for (int k = static_cast<int>(orderB.size()) - 1; k >= 0; --k)
+            result.push_back(sideIdx[B][orderB[k]]);
+
+    return result;
+}
+
 } // namespace Ekos

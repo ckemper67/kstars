@@ -503,6 +503,94 @@ static void testDeterminism()
     EXPECT(order1 == order2, "deterministic: same input -> same output");
 }
 
+// Count strict HA sign changes (haPrev * haCur < 0) in an order sequence.
+static int countMeridianCrossings(const std::vector<AlignOrderPoint> &pts,
+                                  const std::vector<int> &order,
+                                  const AlignOrderPoint &start,
+                                  double lst_h)
+{
+    int crossings = 0;
+    double prevHA = rangeHA(lst_h - start.ra_h);
+    for (int idx : order)
+    {
+        double curHA = rangeHA(lst_h - pts[idx].ra_h);
+        if (prevHA * curHA < 0.0)
+            crossings++;
+        prevHA = curHA;
+    }
+    return crossings;
+}
+
+static void testTwoPhaseValidPermutation()
+{
+    const double lst = 6.0;
+    auto pts = generateHaltonPoints(60, lst, 34.0, 20.0, 85.0, 80.0);
+    AlignOrderPoint start; start.ra_h = rangeRA(lst); start.dec_deg = 34.0;
+
+    auto order = Ekos::alignOrderOptimizationTwoPhase(pts, start, lst);
+    EXPECT(isValidPermutation(order, static_cast<int>(pts.size())),
+           "two-phase N=60: output is valid permutation");
+}
+
+static void testTwoPhaseBothSidesOneFlip()
+{
+    // Points explicitly placed on both pier sides; two-phase must cross the
+    // meridian exactly once.
+    const double lst = 6.0;
+    std::vector<AlignOrderPoint> pts;
+
+    // 10 east points (HA = -1..-4)
+    for (int i = 0; i < 10; i++)
+    {
+        AlignOrderPoint p;
+        p.ra_h    = rangeRA(lst + 1.0 + i * 0.3);
+        p.dec_deg = 20.0 + i * 3.0;
+        pts.push_back(p);
+    }
+    // 10 west points (HA = +1..+4)
+    for (int i = 0; i < 10; i++)
+    {
+        AlignOrderPoint p;
+        p.ra_h    = rangeRA(lst - 1.0 - i * 0.3);
+        p.dec_deg = 20.0 + i * 3.0;
+        pts.push_back(p);
+    }
+
+    AlignOrderPoint start; start.ra_h = rangeRA(lst); start.dec_deg = 34.0;
+    auto order = Ekos::alignOrderOptimizationTwoPhase(pts, start, lst);
+
+    EXPECT(isValidPermutation(order, 20),
+           "two-phase both-sides: valid permutation");
+
+    int crossings = countMeridianCrossings(pts, order, start, lst);
+    EXPECT(crossings == 1,
+           "two-phase both-sides: exactly 1 meridian crossing");
+}
+
+static void testTwoPhaseSingleSideFallback()
+{
+    // All points are east of the meridian (HA < 0).  Two-phase falls back to
+    // single-side optimization and must produce a valid permutation with 0
+    // meridian crossings.
+    const double lst = 6.0;
+    std::vector<AlignOrderPoint> pts;
+    for (int i = 0; i < 15; i++)
+    {
+        AlignOrderPoint p;
+        p.ra_h    = rangeRA(lst + 1.0 + i * 0.4);  // HA = -(1+i*0.4), all east
+        p.dec_deg = 15.0 + i * 4.0;
+        pts.push_back(p);
+    }
+
+    AlignOrderPoint start; start.ra_h = rangeRA(lst); start.dec_deg = 34.0;
+    auto order = Ekos::alignOrderOptimizationTwoPhase(pts, start, lst);
+
+    EXPECT(isValidPermutation(order, 15),
+           "two-phase single-side fallback: valid permutation");
+    EXPECT(countMeridianCrossings(pts, order, start, lst) == 0,
+           "two-phase single-side fallback: 0 meridian crossings");
+}
+
 // ---- Main -------------------------------------------------------------------
 
 int main()
@@ -524,6 +612,9 @@ int main()
     testThreePoints();
     testHAWrappingBoundary();
     testDeterminism();
+    testTwoPhaseValidPermutation();
+    testTwoPhaseBothSidesOneFlip();
+    testTwoPhaseSingleSideFallback();
 
     std::printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
