@@ -9,18 +9,26 @@ endif(APPLE)
 # Build citydb.sqlite from TSV files at build time
 find_package(Python3 REQUIRED)
 set(GEN_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate-citydb.py)
+set(GEN_SHARED ${CMAKE_CURRENT_SOURCE_DIR}/tools/kstars_geo.py)
 set(CITYDB_SQLITE ${CMAKE_CURRENT_BINARY_DIR}/citydb.sqlite)
 set(CITYDB_TSV ${CMAKE_CURRENT_SOURCE_DIR}/citydb.tsv)
+set(GEONAMES_TSV ${CMAKE_CURRENT_SOURCE_DIR}/cities15000.tsv)
+set(GEONAMES_I18N_TSV ${CMAKE_CURRENT_SOURCE_DIR}/cities15000_i18n.tsv)
 set(COUNTRY_INFO ${CMAKE_CURRENT_SOURCE_DIR}/countryInfo.txt)
+
+set(CITYDB_MIN_POPULATION 50000 CACHE STRING
+    "Minimum population for GeoNames cities included in citydb.sqlite")
 
 add_custom_command(
     OUTPUT ${CITYDB_SQLITE}
     COMMAND ${Python3_EXECUTABLE} ${GEN_SCRIPT}
         --countries ${COUNTRY_INFO} --strict
         --sqlite ${CITYDB_SQLITE}
-        ${CITYDB_TSV}
-    DEPENDS ${GEN_SCRIPT} ${CITYDB_TSV} ${COUNTRY_INFO}
-    COMMENT "Generating city database..."
+        --min-population ${CITYDB_MIN_POPULATION}
+        --i18n-file ${GEONAMES_I18N_TSV}
+        ${CITYDB_TSV} ${GEONAMES_TSV}
+    DEPENDS ${GEN_SCRIPT} ${GEN_SHARED} ${CITYDB_TSV} ${GEONAMES_TSV} ${COUNTRY_INFO} ${GEONAMES_I18N_TSV}
+    COMMENT "Generating city database (min-population ${CITYDB_MIN_POPULATION})..."
     VERBATIM
 )
 add_custom_target(generate_citydb ALL DEPENDS ${CITYDB_SQLITE})
@@ -248,6 +256,8 @@ install( FILES ${camera_files} DESTINATION ${KSTARS_DATADIR}/kstars/cameradata )
 install( FILES taskqueue/templates/README.md DESTINATION ${KSTARS_DATADIR}/kstars/taskqueue/templates )
 
 # Install system task queue templates
+# Destination must keep the /system subdirectory: TemplateManager::loadSystemTemplates()
+# locates "taskqueue/templates/system" as a directory (templatemanager.cpp).
 file(GLOB taskqueue_template_files taskqueue/templates/system/*)
 install( FILES ${taskqueue_template_files} DESTINATION ${KSTARS_DATADIR}/kstars/taskqueue/templates/system )
 

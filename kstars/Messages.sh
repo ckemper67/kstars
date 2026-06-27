@@ -19,7 +19,9 @@ sed -e "s/\([0-9].*[a-z]\)//" < data/cnames.dat | sed 's/^[A-B] //' | \
 grep ^C data/cnames.dat | gawk '{ print "xi18nc( \"Sky Culture\", \"" $2 "\" );" }' >> "kstars_i18n.cpp"
 
 # City data (name, province, country)
-python3 data/scripts/extract_geo_data.py >> "kstars_i18n.cpp"
+python3 data/tools/generate-citydb.py --extract-l10n --min-population 50000 \
+    data/countryInfo.txt data/admin1CodesASCII.txt data/timeZones.txt \
+    data/citydb.tsv data/cities15000.tsv >> "kstars_i18n.cpp"
 
 # extract image/info menu items
 gawk 'BEGIN {FS=":"}; (NF==4 && $3~"http") {gsub(/"/, "\\\""); print "xi18nc(\"Image/info menu item (should be translated)\",\"" $2 "\");"; }' < data/image_url.dat | sed 's/xi18nc(.*,"");//' >> "image_url.tmp"
