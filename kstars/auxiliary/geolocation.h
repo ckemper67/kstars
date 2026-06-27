@@ -41,7 +41,7 @@ class GeoLocation
              */
         GeoLocation(const dms &lng, const dms &lat, const QString &name = "Nowhere", const QString &province = "Nowhere",
                     const QString &country = "Nowhere", double TZ = 0, TimeZoneRule *TZrule = nullptr,
-                    double elevation = -10, bool readOnly = false, int iEllips = 4);
+                    double elevation = -10, bool readOnly = false, int iEllips = 4, int geonameId = 0, const QString &translatedName = QString());
 
         /** Constructor using doubles to specify X, Y and Z referred to the center of the Earth.
              * @param x the x-position, in m
@@ -58,7 +58,7 @@ class GeoLocation
              */
         GeoLocation(double x, double y, double z, const QString &name = "Nowhere", const QString &province = "Nowhere",
                     const QString &country = "Nowhere", double TZ = 0, TimeZoneRule *TZrule = nullptr,
-                    double elevation = -10, bool readOnly = false, int iEllips = 4);
+                    double elevation = -10, bool readOnly = false, int iEllips = 4, int geonameId = 0, const QString &translatedName = QString());
 
         /** @return pointer to the longitude dms object */
         const CachingDms *lng() const
@@ -128,6 +128,16 @@ class GeoLocation
 
         /** @return translated Country name */
         QString translatedCountry() const;
+
+        /** @return GeoNames ID */
+        int geonameId() const { return GeonameId; }
+        /** Set GeoNames ID */
+        void setGeonameId(int id) { GeonameId = id; }
+
+        /** @return database-loaded translated City name */
+        QString dbTranslatedName() const { return TranslatedName; }
+        /** Set database-loaded translated City name */
+        void setDbTranslatedName(const QString &name) { TranslatedName = name; }
 
         /** @return comma-separated city, province, country names (each localized) */
         QString fullName() const;
@@ -333,4 +343,6 @@ class GeoLocation
         long double PosCartX, PosCartY, PosCartZ;
         int indexEllipsoid;
         bool ReadOnly;
+        int GeonameId;
+        QString TranslatedName;
 };

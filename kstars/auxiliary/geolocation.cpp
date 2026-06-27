@@ -15,7 +15,7 @@
 
 GeoLocation::GeoLocation(const dms &lng, const dms &lat, const QString &name, const QString &province,
                          const QString &country,
-                         double tz, TimeZoneRule *tzrule, double elevation, bool readOnly, int iEllips) :
+                         double tz, TimeZoneRule *tzrule, double elevation, bool readOnly, int iEllips, int geonameId, const QString &translatedName) :
     Longitude(lng), Latitude(lat)
 {
     Name           = name;
@@ -26,12 +26,14 @@ GeoLocation::GeoLocation(const dms &lng, const dms &lat, const QString &name, co
     Elevation      = elevation;
     indexEllipsoid = iEllips;
     ReadOnly       = readOnly;
+    GeonameId      = geonameId;
+    TranslatedName = translatedName;
     setEllipsoid(indexEllipsoid);
     geodToCart();
 }
 
 GeoLocation::GeoLocation(double x, double y, double z, const QString &name, const QString &province,
-                         const QString &country, double TZ, TimeZoneRule *tzrule, double elevation, bool readOnly, int iEllips)
+                         const QString &country, double TZ, TimeZoneRule *tzrule, double elevation, bool readOnly, int iEllips, int geonameId, const QString &translatedName)
 {
     PosCartX       = x;
     PosCartY       = y;
@@ -44,6 +46,8 @@ GeoLocation::GeoLocation(double x, double y, double z, const QString &name, cons
     Elevation      = elevation;
     indexEllipsoid = iEllips;
     ReadOnly       = readOnly;
+    GeonameId      = geonameId;
+    TranslatedName = translatedName;
     setEllipsoid(indexEllipsoid);
     cartToGeod();
 }
@@ -80,6 +84,10 @@ void GeoLocation::changeEllipsoid(int index)
 
 QString GeoLocation::translatedName() const
 {
+    if (GeonameId > 0 && !TranslatedName.isEmpty())
+    {
+        return TranslatedName;
+    }
     QString context;
     if (province().isEmpty())
     {

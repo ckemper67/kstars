@@ -34,6 +34,7 @@
 
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include "citydb_helpers.h"
 #include <QtConcurrent>
 
 #include "kstars_debug.h"
@@ -451,75 +452,59 @@ SkyObject *KStarsData::objectNamed(const QString &name)
 
 bool KStarsData::readCityData()
 {
-    QSqlDatabase citydb = QSqlDatabase::addDatabase("QSQLITE", "citydb");
-    QString dbfile      = KSPaths::locate(QStandardPaths::AppLocalDataLocation, "citydb.sqlite");
-    citydb.setDatabaseName(dbfile);
-    if (citydb.open() == false)
-    {
-        qCCritical(KSTARS) << "Unable to open city database file " << dbfile << citydb.lastError().text();
-        return false;
-    }
-
-    QSqlQuery get_query(citydb);
-
-    //get_query.prepare("SELECT * FROM city");
-    if (!get_query.exec("SELECT * FROM city"))
-    {
-        qCCritical(KSTARS) << get_query.lastError();
-        return false;
-    }
-
     bool citiesFound = false;
-    // get_query.size() always returns -1 so we set citiesFound if at least one city is found
-    while (get_query.next())
+
+    // Reading the shipped, read-only system database. Scope the QSqlDatabase in
+    // its own block so the local copy is destroyed before removeDatabase, which
+    // Qt requires to avoid a "connection still in use" warning.
     {
-        citiesFound          = true;
-        QString name         = get_query.value(1).toString();
-        QString province     = get_query.value(2).toString();
-        QString country      = get_query.value(3).toString();
-        dms lat              = dms(get_query.value(4).toString());
-        dms lng              = dms(get_query.value(5).toString());
-        double TZ            = get_query.value(6).toDouble();
-        TimeZoneRule *TZrule = &(Rulebook[get_query.value(7).toString()]);
-        double elevation     = get_query.value(8).toDouble();
-
-        // appends city names to list
-        geoList.append(new GeoLocation(lng, lat, name, province, country, TZ, TZrule, elevation, true, 4));
-    }
-    citydb.close();
-
-    // Reading local database
-    QSqlDatabase mycitydb = QSqlDatabase::addDatabase("QSQLITE", "mycitydb");
-    dbfile = QDir(KSPaths::writableLocation(QStandardPaths::AppLocalDataLocation)).filePath("mycitydb.sqlite");
-
-    if (QFile::exists(dbfile))
-    {
-        mycitydb.setDatabaseName(dbfile);
-        if (mycitydb.open())
+        const QString dbfile = KSPaths::locate(QStandardPaths::AppLocalDataLocation, "citydb.sqlite");
+        QSqlDatabase citydb = QSqlDatabase::addDatabase("QSQLITE", "citydb");
+        citydb.setDatabaseName(dbfile);
+        if (citydb.open())
         {
-            QSqlQuery get_query(mycitydb);
-
-            if (!get_query.exec("SELECT * FROM city"))
-            {
-                qDebug() << Q_FUNC_INFO << get_query.lastError();
-                return false;
-            }
-            while (get_query.next())
-            {
-                QString name         = get_query.value(1).toString();
-                QString province     = get_query.value(2).toString();
-                QString country      = get_query.value(3).toString();
-                dms lat              = dms(get_query.value(4).toString());
-                dms lng              = dms(get_query.value(5).toString());
-                double TZ            = get_query.value(6).toDouble();
-                TimeZoneRule *TZrule = &(Rulebook[get_query.value(7).toString()]);
-                double elevation     = get_query.value(8).toDouble();
-
-                // appends city names to list
-                geoList.append(new GeoLocation(lng, lat, name, province, country, TZ, TZrule, elevation, false, 4));
-            }
-            mycitydb.close();
+            const QString localeName = QLocale::system().name().toLower();
+            const QString baseLang   = localeName.split('_').first().toLower();
+            citiesFound = loadCitiesFromDb(citydb, localeName, baseLang, geoList, Rulebook);
+            citydb.close();
         }
+        else
+        {
+            qCCritical(KSTARS) << "Unable to open city database file " << dbfile << citydb.lastError().text();
+        }
+    }
+    QSqlDatabase::removeDatabase("citydb");
+
+    if (!citiesFound)
+    {
+        qCCritical(KSTARS) << "Failed to load city data";
+        return false;
+    }
+
+    // Reading the user's editable local database, if present. Its cities are
+    // read-write (readOnly = false), unlike the system database above.
+    const QString mydbfile = QDir(KSPaths::writableLocation(QStandardPaths::AppLocalDataLocation)).filePath("mycitydb.sqlite");
+    if (QFile::exists(mydbfile))
+    {
+        {
+            QSqlDatabase mycitydb = QSqlDatabase::addDatabase("QSQLITE", "mycitydb");
+            mycitydb.setDatabaseName(mydbfile);
+            if (mycitydb.open())
+            {
+                QSqlQuery get_query(mycitydb);
+                if (get_query.exec("SELECT * FROM city"))
+                {
+                    while (get_query.next())
+                        geoList.append(geoLocationFromCityRow(get_query, Rulebook, false));
+                }
+                else
+                {
+                    qDebug() << Q_FUNC_INFO << get_query.lastError();
+                }
+                mycitydb.close();
+            }
+        }
+        QSqlDatabase::removeDatabase("mycitydb");
     }
 
     return citiesFound;
