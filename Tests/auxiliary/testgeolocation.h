@@ -1,4 +1,4 @@
-/*  KStars UI tests
+/*  KStars class tests
     SPDX-FileCopyrightText: 2020 Eric Dejouhanet <eric.dejouhanet@gmail.com>
 
     SPDX-License-Identifier: GPL-2.0-or-later
@@ -29,10 +29,19 @@ class TestGeolocation : public QObject
         void init();
         void cleanup();
 
-        void testGeolocation_data();
-        void testGeolocation();
-        void testParseCityDatabase();
-        void testCoordinates();
+        // GeoLocation unit tests -- no database required
+        void testTranslatedNameFromDb();
+        void testTranslatedNameFallback();
+
+        // End-to-end: real citydb.sqlite, real query, real GeoLocation
+        void testCityI18nSchema();
+        void testLoadCitiesFromDb();
+        void testLoadCitiesFromDbEmptyReturnsFalse();
+        void testI18nExactLocaleBeatsBase();
+        void testPlainQueryNoTranslation();
+        void testCologneGermanLocale();
+        void testTokyoJapaneseLocale();
+        void testDubaiArabicLocale();
 };
 
 #endif // TESTGEOLOCATION_H

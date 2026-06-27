@@ -51,6 +51,8 @@ SET_TESTS_PROPERTIES( TestFOV PROPERTIES LABELS "stable")
 
 ADD_EXECUTABLE( testgeolocation testgeolocation.cpp )
 TARGET_LINK_LIBRARIES( testgeolocation ${TEST_LIBRARIES})
+TARGET_COMPILE_DEFINITIONS( testgeolocation PRIVATE
+    KSTARS_CITYDB_PATH="${CMAKE_BINARY_DIR}/kstars/data/citydb.sqlite" )
 ADD_TEST( NAME TestGeolocation COMMAND testgeolocation )
 SET_TESTS_PROPERTIES( TestGeolocation PROPERTIES LABELS "stable")
 
